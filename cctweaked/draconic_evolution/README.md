@@ -9,6 +9,42 @@
 
 Colors: green = charging (input > output), red = draining, yellow = balanced, orange = offline/disconnected.
 
+## Commands
+
+Each script takes its arguments on the command line, so no file edits are needed per machine.
+
+### `draconic_wireless_sender.lua`
+
+```text
+draconic_wireless_sender "Energy Core 0" "draconic_wireless_dash" "back"
+```
+
+Core name and dashboard hostname are required; the pylon side is optional and defaults to `back`.
+
+### `draconic_wireless_dash.lua`
+
+```text
+draconic_wireless_dash "draconic_wireless_dash"
+```
+
+Hostname is optional: without it, the computer's label is used (label the machine `draconic_wireless_dash`, or pass the argument explicitly).
+
+### `draconic_wireless_remote.lua`
+
+```text
+draconic_wireless_remote "draconic_wireless_dash"
+```
+
+Argument is the main dashboard's hostname to listen for; defaults to `draconic_wireless_dash`.
+
+### `draconic_wireless_pocket.lua`
+
+```text
+draconic_wireless_pocket "draconic_wireless_dash"
+```
+
+Argument is the dashboard hostname to listen for; defaults to `draconic_wireless_dash`.
+
 ## startup.lua examples
 
 ```lua

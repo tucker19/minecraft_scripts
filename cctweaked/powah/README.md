@@ -10,10 +10,56 @@
 
 Protocols: `powah_telemetry_v1` (senders → dash), `powah_pocket_v1` (dash → pocket).
 
+## Commands
+
+Each script takes its arguments on the command line, so no file edits are needed per machine.
+
+### `wired_reactor.lua`
+
+```text
+wired_reactor
+```
+
+No arguments. Reads every wired `uraninite_reactor` and draws the local dashboard; no wireless.
+
+### `wired_reactor_bank.lua`
+
+```text
+wired_reactor_bank "Nitro Reactor Bank 00"
+```
+
+Bank name is optional: without it, the computer's label is used, then `"Bank <id>"`.
+
+### `reactor_wireless_sender.lua`
+
+```text
+reactor_wireless_sender "Spirited Reactor 0" "reactor_wireless_dash"
+```
+
+Second argument is the dashboard hostname or its numeric ID (`3`). Both arguments are required.
+
+### `reactor_wireless_dash.lua`
+
+```text
+reactor_wireless_dash "reactor_wireless_dash"
+```
+
+Hostname is optional: without it, the computer's label is used. Passing it explicitly avoids the label-fallback mismatch you hit before.
+
+### `reactor_wireless_pocket.lua`
+
+```text
+reactor_wireless_pocket "reactor_wireless_dash"
+```
+
+Argument is the dashboard hostname to listen for; defaults to `reactor_wireless_dash`.
+
 ## startup.lua examples
 
 ```lua
--- wired bank
+-- old local-only bank
+shell.execute("/wired_reactor")
+-- wireless bank
 shell.execute("/wired_reactor_bank", "Nitro Reactor Bank 00")
 -- single reactor sender
 shell.execute("/reactor_wireless_sender", "Spirited Reactor 0", "reactor_wireless_dash")
