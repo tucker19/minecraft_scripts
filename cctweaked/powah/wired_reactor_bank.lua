@@ -114,7 +114,7 @@ while true do
 
     for _, name in ipairs(names) do
         local device = peripheral.wrap(name)
-        local data = {name = name}
+        local data = {name = name, connected = device ~= nil}
 
         if device then
             data.stored = read(device, {"getStoredEnergy"})
@@ -147,6 +147,7 @@ while true do
         for index, data in ipairs(reactors) do
             rednet.broadcast({
                 name        = BANK_NAME .. " R" .. index,
+                connected   = data.connected,
                 stored      = data.stored,
                 capacity    = data.capacity,
                 running     = data.running,

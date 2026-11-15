@@ -185,7 +185,7 @@ local function receiveTelemetry(sender, message)
         data.running = message.running
     end
 
-    latest[sender] = data
+    latest[data.name] = data
 end
 
 local function makeSnapshot()
@@ -215,12 +215,12 @@ local function makeSnapshot()
         }
     }
 
-    for sender, cached in pairs(latest) do
+    for _, cached in pairs(latest) do
         local age = math.max(0, (now - cached.received) / 1000)
 
         local data = {
             name = cached.name,
-            sender = sender,
+            sender = cached.sender,
             age = age,
             connected = cached.connected,
             stale = age > STALE_SECONDS
