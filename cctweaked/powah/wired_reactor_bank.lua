@@ -226,6 +226,23 @@ while true do
         width
     )
 
+    -- Shows whether this bank is actually broadcasting.
+    if wirelessModem then
+        text(
+            1, 3,
+            "Broadcasting on " .. PROTOCOL,
+            colors.lime,
+            width
+        )
+    else
+        text(
+            1, 3,
+            "No wireless modem - local display only",
+            colors.orange,
+            width
+        )
+    end
+
     -- Use proportional panels instead of fixed screen coordinates.
     local sideBySide = width >= 38 and height >= 18
     local leftWidth = sideBySide
