@@ -32,6 +32,9 @@ local STATUS_COLOR = {
     waiting_fuel = colors.orange,
     blocked = colors.orange,
     complete = colors.cyan,
+    recovering = colors.yellow,
+    resumed = colors.lime,
+    recovery_required = colors.red,
     stopped = colors.red,
     error = colors.red,
 }
@@ -51,7 +54,7 @@ local function gpsLine(loc, received)
     local where = string.format("%.0f %.0f %.0f", g.x or 0, g.y or 0, g.z or 0)
     if g.moved or age > GPS_STALE_SECONDS then
         return "GPS last fix " .. where .. ", " .. age
-            .. "s ago - STALE (turtle moved since)", colors.gray
+            .. "s ago - STALE" .. (g.moved and " (turtle moved since)" or ""), colors.gray
     end
     return "GPS " .. where .. " (" .. age .. "s ago)", colors.lightBlue
 end
@@ -111,14 +114,14 @@ local function draw()
 
         local loc = d.location or {}
         local p = loc.relative or {}
-        row(y + 5, string.format(
+        row(y + 5, loc.uncertain and "Position / heading not verified" or string.format(
             "Position: forward %s, up %s, right %s | facing %s",
             p.x or "?", p.y or "?", p.z or "?",
             HEADING[loc.heading] or "?"), colors.lightBlue)
 
         local gtext, gcol = gpsLine(loc, d.received)
         row(y + 6, gtext, gcol)
-        row(y + 7, d.detail or "", colors.gray)
+        row(y + 7, tostring(d.detail or ""):match("^[^\r\n]*"), colors.gray)
     end
 
     row(h, "Left/right or scroll: pages | touch: next", colors.gray)

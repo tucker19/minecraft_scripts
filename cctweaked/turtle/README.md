@@ -4,6 +4,8 @@
 
 `turtle_wireless_dash.lua` shows every quarry turtle broadcasting on `turtle_quarry_v1`. You don't configure a turtle ID.
 
+The turtle saves an active job to its own filesystem. It stops when its chunk unloads and can continue the same job when the chunk loads and the computer boots. A chunk loader is not required. An interrupted action whose outcome cannot be established safely pauses for verification instead of risking a wrong move.
+
 ## Base placement and configuration
 
 Home is the turtle's original cell and facing when you start the program. The quarry extends forward and to the right of home. Digging starts one block below home, so the home level (and anything beside the turtle) is never dug.
@@ -32,14 +34,22 @@ Other settings:
 
 ## Download and run
 
-On a mining turtle with a pickaxe and, optionally, a wireless or Ender modem upgrade:
+On a mining turtle with a pickaxe and, optionally, a wireless or Ender modem upgrade, download to the root of its filesystem. If the old `chunk_dig` is already installed, do not replace it while that job is running; see [One-time migration](#one-time-migration).
 
 ```text
-wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/chunk_dig.lua chunk_dig
+wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/chunk_dig.lua /chunk_dig
 chunk_dig 1 "Mining Quarry 01"
 ```
 
-The first argument is the side length in chunks: `1` = 16×16, `2` = 32×32, `3` = 48×48 blocks. The optional second argument is the job name shown on the dashboard; without it the turtle label is used. Align the turtle to chunk boundaries yourself if you need that.
+Edit `OUTPUT_SIDE` and `FUEL_SIDE` before running the second command. Start only while the turtle is at its base, facing the intended quarry. The first argument is the side length in chunks: `1` = 16×16, `2` = 32×32, `3` = 48×48 blocks. The optional second argument sets the job name; without it the turtle label is used. A new job refuses to replace existing state, even if the job is complete. Align the turtle to chunk boundaries yourself if needed, and note the home block's world coordinates and compass facing so you can verify a pending turn later even without GPS.
+
+Optional GPS-anchored start, if the turtle is actually facing east:
+
+```text
+chunk_dig 1 "Mining Quarry 01" east
+```
+
+Use `north`, `east`, `south` or `west` to match the turtle's starting facing. Verify this yourself in Minecraft; the argument does not turn the turtle. This requires an initial GPS fix and saves the original world XYZ and cardinal direction. It makes interrupted moves recoverable even with unlimited fuel and provides world coordinates in manual recovery instructions. The [CC:Tweaked GPS setup guide](https://tweaked.cc/guide/gps_setup.html) explains the modem and host setup. GPS hosts need to be reachable and loaded when used; they are optional and are not chunk loaders for the quarry.
 
 On the dashboard computer, with a wireless or Ender modem and optionally a monitor:
 
@@ -56,7 +66,21 @@ A `/startup.lua` for the dashboard computer only:
 shell.execute("/turtle_wireless_dash", "turtle_wireless_dash")
 ```
 
-Do not put `chunk_dig` in a turtle's `startup.lua` (see [Restart limitations](#restart-limitations)).
+## Enable automatic resume on the turtle
+
+If there is no existing `/startup.lua` or conflicting startup setup, download the provided turtle startup script:
+
+```text
+wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/startup.lua /startup.lua
+```
+
+If you already have startup logic, **keep it**. Back it up, then add this one line after the other setup. The quarry runs in the foreground while active, so put the line last if the rest of startup needs to finish. Do not replace unrelated logic or put the new-job command in startup.
+
+```lua
+shell.execute("/chunk_dig", "auto")
+```
+
+`auto` runs only a compatible active job. With no job or a completed job it returns immediately. With corrupt state or unresolved motion it reports `recovery_required` and returns without mining or starting another job. The boot hook can run only when the computer boots; if your server reloads the turtle without booting its computer, turn it on or use `chunk_dig resume`. Don't run another turtle-control program concurrently.
 
 ## Slot behaviour
 
@@ -94,8 +118,10 @@ The turtle keeps broadcasting telemetry while waiting.
 | `waiting_output` | Output barrel full, missing, or a transfer failed. The detail says which. | Stays home with the remaining cargo and retries every `RETRY_SECONDS`. |
 | `waiting_fuel` | Fuel inventory empty or missing, it holds non-fuel items, or not enough fuel was obtained. | Stays home and retries automatically when you restock. |
 | `blocked` | A cleared route cell is occupied by something it may not dig, or a mob or entity won't move. | Retries every `RETRY_SECONDS`. |
-| `error` | Base inventories missing at start, the round trip exceeds the fuel limit, or an internal consistency check failed. | Stops in place with slot 1 selected. |
-| `stopped` | Terminated with Ctrl+T. | Stops in place. |
+| `error` | Base inventories missing at start, round trip too large for the fuel limit, or another execution error. | Does not continue mining. Fix the reported issue before resuming. |
+| `stopped` | Terminated with Ctrl+T outside an uncertain motion. | Stops in place and retains the job. |
+| `recovering` / `resumed` | Loading and checking the saved job / verification passed. | Re-enters the exact saved work or service step. |
+| `recovery_required` | The saved state or physical pose cannot be trusted automatically. | No further quarry actions; read the turtle terminal before doing anything. |
 
 Every move, dig, drop, suck, and refuel result is checked. Coordinates change only after a successful move. Items are never thrown into the world. A failed action is never reported as success.
 
@@ -125,15 +151,49 @@ One block per turtle shows:
 
 GPS fixes are taken about every 15 seconds when a GPS network exists. If the turtle has moved since the last fix, or the fix is older than 30 s, it is shown as `STALE` rather than as the current position.
 
-The protocol is still `turtle_quarry_v1`, version 1. New fields (`fuelLimit`, `reserve`, `heading`, `layerCleared`, `layerBlocked`, `layerSkipped`, `trips`, and `gps.moved`) were added without changing existing ones. Update both scripts together.
+The protocol is still `turtle_quarry_v1`, version 1. The dash recognizes the three recovery states and shows **Position / heading not verified** until recovery establishes the pose. An older dash can still receive packets. Update both scripts for the new status display.
 
 ## Chunk loading
 
-Turtles stop when their chunk unloads. Keep the whole quarry footprint and the base chunk loaded while the job runs, for example with a chunk loader or FTB Chunks claims with force-loading, or by staying nearby.
+No force-loading is needed. Unloading pauses work, and startup tries to resume it when the turtle's chunk loads and the computer boots. The job does not run while its chunk is unloaded. If the turtle reaches an unloaded neighboring chunk, the movement is rejected by [CC:Tweaked's movement command](https://raw.githubusercontent.com/cc-tweaked/CC-Tweaked/mc-1.21.x/projects/common/src/main/java/dan200/computercraft/shared/turtle/core/TurtleMoveCommand.java). It waits and retries the same move, so a return to base can also wait until the chunks along the route load naturally.
 
-## Restart limitations
+## Recover manually
 
-Job state is not saved. If the turtle reboots, the server restarts, the chunk unloads, or you press Ctrl+T, the job ends where the turtle stands. Starting `chunk_dig` again would treat that spot as a new home and begin a new quarry there, so the program does not run automatically from `startup.lua`. To continue, move the turtle back to the original home cell and facing by hand, then start a new run. Already-cleared layers are simply passed through as empty space.
+```text
+chunk_dig status
+chunk_dig resume
+```
+
+`status` prints the saved pose, phase, generation, and both candidate poses for any pending move or turn. `resume` never falls back to starting a new job. If anchored GPS is temporarily unavailable, restore it and retry `resume`.
+
+If instructed to resolve a pending action, wait until the turtle is stationary. Check its **actual** position and facing in Minecraft without moving or turning it. With a GPS-anchored job the terminal prints both candidate world coordinates and compass directions; otherwise use the original home and forward/right directions to interpret the relative offsets. Heading `0` is original forward, `1` right, `2` back and `3` left.
+
+```text
+chunk_dig resolve 123 after
+```
+
+Use the displayed generation in place of `123`. Use `before` only if the turtle is in the before pose; use `after` only if it is in the after pose. This resumes immediately on acceptance; it does not move the turtle to the named pose. Do not guess or use this command if it matches neither candidate. If the state itself is corrupt or incompatible, preserve `/.chunk_dig` for diagnosis instead of deleting individual files or copying the older checkpoint over the newer one.
+
+## What recovery does and does not prove
+
+- **Checkpoints:** Two versioned, checksummed checkpoint files alternate under `/.chunk_dig`, with the previous committed copy retained. Writes are staged and read back before publication. An unfinished `.tmp` is not a checkpoint. A corrupt committed file stops recovery rather than rolling back blindly to a pose that might be stale.
+- **Action journal:** Before every move or turn the script publishes the original pose, candidate next pose, fuel observation and checkpoint generation. It keeps that intent until the result is committed. The motion and the execution step that receives its result are recovered together, including a move into the next layer.
+- **Moves:** An anchored job compares a fresh GPS fix with the two candidate positions. Without an anchor, an ordinary interruption with fuel enabled uses exactly one unit of fuel consumed versus no change. The [CC:Tweaked maintainer explains why ordinary chunk unload cannot split teleport and fuel deduction](https://github.com/cc-tweaked/CC-Tweaked/issues/1364); the [movement implementation](https://raw.githubusercontent.com/cc-tweaked/CC-Tweaked/mc-1.21.x/projects/common/src/main/java/dan200/computercraft/shared/turtle/core/TurtleMoveCommand.java) deducts one unit only after teleport succeeds. This inference assumes stock movement, no external fuel changes, and no independent world rollback. Unlimited fuel without GPS or an unexpected delta requires verification.
+- **Turns:** GPS locates the turtle but does not report its facing. Stock turtle turns cost no fuel ([turtle API](https://tweaked.cc/module/turtle.html)). If power is lost after a turn is journaled but before its result is committed, the turtle stops for manual verification, even with GPS. It does not make a test move or assume a turn happened. An already-committed turn does not need this step.
+- **Inventory:** On reboot the live inventory and fuel buffer determine what is left to unload or refuel. For example, a coal block pulled into slot 1 just before shutdown is there to burn on reboot, not a reason to pull another one. A partial unload continues from the slots that still contain cargo. Slot 1 is selected first on startup and restored after temporary selections.
+- **Limits:** The turtle filesystem and Minecraft world are not one transaction (see the [CC:Tweaked persistence discussion](https://github.com/cc-tweaked/CC-Tweaked/issues/535)). Don't manually relocate or turn the turtle, change its fuel buffer while a motion is unresolved, or restore its files separately from the world. An arbitrary server crash, world rollback, copied files, or changed terrain can invalidate a checkpoint. Leave room on the turtle filesystem for two checkpoints plus a staged write; larger footprints and long detours use more space.
+
+## Safely discard or archive a job
+
+1. Stop the quarry with Ctrl+T if it is running, wait for movement to settle, and run `chunk_dig status`. Keep both checkpoint files and the journal together. If you need to recover the active job later, don't manually move, turn or refuel the turtle while its state is archived.
+2. Rename the whole directory to an unused archive name, for example `move /.chunk_dig /.chunk_dig-archive-01`. With the active directory gone, boot will not resume it. Keep the archive until you are sure you no longer need it; do not restore just one checkpoint.
+3. To start a different job, put the turtle at the intended base position and heading, confirm the fuel and output sides, then use the explicit `chunk_dig <chunks> [job name]` command. Don't start a new job from the turtle's mid-quarry position.
+
+## One-time migration
+
+Your currently running pre-persistence quarry has no checkpoint, and this version cannot infer its original home or exact next action. Let it finish on the old script if you can. Otherwise stop it, recover the turtle and cargo manually, and put the turtle back at the original base cell and facing before upgrading. Check the storage-side settings in the new version.
+
+If a legacy `/chunk_dig` already exists, after stopping the old job you can save it as `move /chunk_dig /chunk_dig_legacy` before using the download command. Then either start an explicitly new job from the original base (it will rescan the footprint, including existing air), or use a different known base. Enable auto-resume for the new version only. Don't use `resume` or `resolve` as a migration step.
 
 ## Testing
 
@@ -144,4 +204,4 @@ pip install lupa
 python3 cctweaked/turtle/test_quarry.py
 ```
 
-The scenarios cover all 16 slots in use, slot 1 restored after inventory work, fuel through slot 1 at base, returning when no slot is empty, exact resume, output full then freed, fuel supply empty then restocked, low-fuel return, unlimited fuel, a fuel limit that is too small, failed moves without position drift, Allthemodium detours that change elevation, bedrock pockets that split a layer, configurable storage sides, missing inventories, stale GPS, a 2-chunk job, and the dashboard rendering. This is simulation only; it does not replace a careful first run in game.
+The harness checks the existing quarry behavior and abandons the running Lua coroutine at chosen points before and after moves, turns, digs, transfers, checkpoint publication and phase changes. It boots the startup script against the retained mock world and filesystem, checks for exact continuation without dropped cargo or skipped cells, and exercises waiting states, manual reconciliation, invalid state, and completed jobs. These are mocked process restarts, **not** actual Minecraft chunk unload/reload tests. For an in-game smoke test, use a small sacrificial job, travel far enough to unload it naturally, then return and check `chunk_dig status` or the dashboard before trying it on a large quarry.

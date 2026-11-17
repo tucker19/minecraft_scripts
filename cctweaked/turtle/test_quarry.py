@@ -8,7 +8,10 @@ stationary output and fuel inventories next to home, and checks safety
 rules on every single action, not only the final result.
 """
 from pathlib import Path
-from lupa import LuaRuntime
+try:
+    from lupa.lua52 import LuaRuntime
+except ImportError:
+    from lupa import LuaRuntime
 
 ROOT = Path(__file__).parent
 
@@ -41,6 +44,103 @@ local resumeChecks, resumeFails = 0, 0
 local inTrip = false
 local nestedTrips = 0
 local gpsMovedSeen = false
+local cuts, cutIndex, files, printed = O.cuts or {}, 1, {}, {}
+local directories = {}
+local saveDir = "/.chunk_dig"
+local queuedMove, move
+local function fault(name)
+    local want = cuts[cutIndex]
+    if want == name or (want and last and want == name .. ":" .. last.status) then
+        cutIndex = cutIndex + 1
+        coroutine.yield("POWER_CUT", name)
+    end
+end
+local function encode(v)
+    local kind=type(v)
+    if kind == "string" then return string.format("%q", v) end
+    if kind == "number" or kind == "boolean" then return tostring(v) end
+    assert(kind == "table", kind)
+    local parts={"{"}
+    for k,x in pairs(v) do
+        parts[#parts+1]="[" .. encode(k) .. "]=" .. encode(x) .. ","
+    end
+    parts[#parts+1]="}"
+    return table.concat(parts)
+end
+textutils = {
+    serialize=encode,
+    unserialize=function(s)
+        local f=load("return " .. s,"record","t",{})
+        if f then local ok,t=pcall(f); if ok then return t end end
+    end,
+}
+fs = {
+    exists=function(path) return files[path] ~= nil or directories[path] ~= nil end,
+    makeDir=function(path) directories[path]=true end,
+    delete=function(path)
+        if path == saveDir .. "/action" then fault("before_action_clear") end
+        files[path]=nil
+    end,
+    move=function(a,b)
+        local action=b==saveDir .. "/action"
+        fault(action and "before_action_publish" or "before_state_publish")
+        assert(files[a] and not files[b])
+        files[b],files[a]=files[a],nil
+        fault(action and "after_action_publish" or "after_state_publish")
+    end,
+    open=function(path,mode)
+        if mode=="r" then
+            if not files[path] then return nil,"missing" end
+            return {readAll=function() return files[path] end,close=function() end}
+        end
+        assert(mode=="w")
+        files[path]=""
+        return {write=function(s)
+            local action=path==saveDir .. "/action.tmp"
+            fault(action and "before_action_write" or "before_state_write")
+            -- Leave a truncated staged file when power is cut during write.
+            files[path]=s:sub(1,math.floor(#s/2))
+            fault(action and "during_action_write" or "during_state_write")
+            files[path]=s
+            fault(action and "after_action_write" or "after_state_write")
+        end,close=function() end}
+    end,
+}
+local function record(path)
+    return files[path] and textutils.unserialize(files[path]:match("\n(.*)$"))
+end
+function latest_record()
+    local a,b=record(saveDir .. "/0"),record(saveDir .. "/1")
+    if a and b then return a.seq>b.seq and a or b end
+    return a or b
+end
+function corrupt_latest()
+    local r=latest_record()
+    files[saveDir .. "/" .. r.seq%2]="QUARRY 1 state 0\n{broken"
+end
+function corrupt_action() files[saveDir .. "/action"]="QUARRY 1 action 0\ncorrupt" end
+function delete_latest()
+    local r=latest_record()
+    files[saveDir .. "/" .. r.seq%2]=nil
+end
+function different_version()
+    local r=latest_record()
+    local p=saveDir .. "/" .. r.seq%2
+    files[p]=files[p]:gsub("^QUARRY 1 ", "QUARRY 42 ")
+end
+function power_change(n) if type(fuel)=="number" then fuel=fuel+n end end
+function manual_choice()
+    local j=record(saveDir .. "/action")
+    local function at(p) return p.x==px and p.y==py and p.z==pz and p.h==hd end
+    if j and at(j.before) then return j.seq,"before" end
+    if j and at(j.after) then return j.seq,"after" end
+end
+function launch(f,...)
+    local co=coroutine.create(f)
+    local ok,what,event=coroutine.resume(co,...)
+    assert(ok,what)
+    return what,event
+end
 
 local FUEL_VALUE = {["minecraft:coal_block"] = 800, ["minecraft:coal"] = 80}
 local function key(x, y, z) return x .. "," .. y .. "," .. z end
@@ -142,7 +242,14 @@ local function requireSlot1(what)
     if selected ~= 1 then v(what .. " with slot " .. selected .. " selected") end
 end
 
-local function move(dir)
+move = function(dir)
+    local want=cuts[cutIndex]
+    if want=="queue_move" or (want and last and want=="queue_move:" .. last.status) then
+        queuedMove=dir
+        fault("queue_move")
+    end
+    fault("before_move")
+    fault("before_move_" .. dir)
     tick(0.4)
     requireSlot1("move " .. dir)
     if fuel ~= "unlimited" and fuel <= 0 then return false, "Out of fuel" end
@@ -175,10 +282,13 @@ local function move(dir)
     if y < minY then minY = y end
     if fuel ~= "unlimited" then fuel = fuel - 1 end
     moveCount = moveCount + 1
+    fault("after_move_" .. dir)
+    fault("after_move")
     return true
 end
 
 local function dig(dir)
+    fault("before_dig")
     tick()
     requireSlot1("dig " .. dir)
     local x, y, z = coord(dir)
@@ -200,6 +310,7 @@ local function dig(dir)
     end
     minedItems = minedItems + 1
     insert(dropOf(name), 1)
+    fault("after_dig")
     return true
 end
 
@@ -216,6 +327,7 @@ local function invAt(dir)
 end
 
 local function drop(dir, count)
+    fault("before_drop")
     tick()
     local s = slots[selected]
     if not s then return false, "No items to drop" end
@@ -241,10 +353,12 @@ local function drop(dir, count)
     end
     s.count = s.count - n
     if s.count == 0 then slots[selected] = nil end
+    fault("after_drop")
     return true
 end
 
 local function suck(dir, count)
+    fault("before_suck")
     tick()
     local kind = invAt(dir)
     if kind ~= "fuel" then return false, "No items to take" end
@@ -254,6 +368,7 @@ local function suck(dir, count)
             st.count = st.count - n
             if st.count == 0 then table.remove(fuelInv, i) end
             insert(st.name, n)
+            fault("after_suck")
             return true
         end
     end
@@ -283,8 +398,10 @@ local function wrapSide(side)
         if kind then return {list = function() return {} end, size = function() return 27 end} end
         return nil
     end
-    if invAt(dir) then
-        return {list = function() return {} end, size = function() return 27 end}
+    local kind=invAt(dir)
+    if kind then
+        return {list = function() return kind=="fuel" and fuelInv or outputItems end,
+            size = function() return 27 end}
     end
     return nil
 end
@@ -292,13 +409,15 @@ end
 os.getComputerID = function() return 12 end
 os.getComputerLabel = function() return "Test Turtle" end
 os.clock = function() return T end
-print = function() end
+os.epoch = function() return 1700000000000+math.floor(T*1000) end
+print = function(s) printed[#printed+1]=s end
 sleep = function(n)
     tick(n)
+    fault("sleep")
     if last and (last.status == "complete" or last.status == "error"
         or last.status == "stopped" or last.status == O.stopStatus)
     then
-        error("TEST_END")
+        coroutine.yield("TEST_END")
     end
 end
 
@@ -320,7 +439,8 @@ rednet = {
         if protocol ~= "turtle_quarry_v1" then v("wrong protocol") end
         if selected ~= 1 then v("broadcast with slot " .. selected) end
         local r = p.location.relative
-        if r.x ~= px or r.y ~= py or r.z ~= pz or p.location.heading ~= hd then
+        if p.location.uncertain and (r or p.location.heading) then v("unverified pose published") end
+        if r and (r.x ~= px or r.y ~= py or r.z ~= pz or p.location.heading ~= hd) then
             v("position drift: script " .. r.x .. "," .. r.y .. "," .. r.z
                 .. " h" .. p.location.heading .. " vs true " .. px .. "," .. py
                 .. "," .. pz .. " h" .. hd)
@@ -330,10 +450,13 @@ rednet = {
         if not last or last.status ~= p.status then
             statuses[#statuses + 1] = p.status
             if p.status == "returning_to_unload" or p.status == "returning_to_refuel" then
-                if inTrip then nestedTrips = nestedTrips + 1 end
-                inTrip = true
-                pendingResume = {px, py, pz, hd}
-                if p.detail == "no empty cargo slot" then cargoDetail = true end
+                if not inTrip then
+                    inTrip = true
+                    pendingResume = {px, py, pz, hd}
+                    if p.detail == "no empty cargo slot" then cargoDetail = true end
+                elseif not last or (last.status~="resumed" and last.status~="blocked") then
+                    nestedTrips = nestedTrips + 1
+                end
             elseif p.status == "mining" and pendingResume then
                 resumeChecks = resumeChecks + 1
                 local s = pendingResume
@@ -346,10 +469,11 @@ rednet = {
         end
         last = p
         packets[#packets + 1] = p
+        fault("phase")
     end,
 }
 gps = {locate = function()
-    if O.gps then return 1000 + px, 64 + py, 2000 + pz end
+    if O.gps then return 1000 + px + (O.gpsOffset or 0), 64 + py, 2000 + pz end
     return nil
 end}
 
@@ -386,6 +510,7 @@ turtle = {
         if not s or not FUEL_VALUE[s.name] then return false, "Items not combustible" end
         if n == 0 then return true end
         if fuel == "unlimited" then return true end
+        fault("before_refuel")
         local k = math.min(n or s.count, s.count)
         for _ = 1, k do
             local before = fuel
@@ -399,11 +524,18 @@ turtle = {
         end
         s.count = s.count - k
         if s.count == 0 then slots[selected] = nil end
+        fault("after_refuel")
         return true
     end,
     inspect = function() return inspect("forward") end,
     inspectUp = function() return inspect("up") end,
-    inspectDown = function() return inspect("down") end,
+    inspectDown = function()
+        if queuedMove then
+            local dir=queuedMove; queuedMove=nil
+            assert(move(dir), "deferred API move did not execute")
+        end
+        return inspect("down")
+    end,
     detect = function() return (inspect("forward")) end,
     detectUp = function() return (inspect("up")) end,
     detectDown = function() return (inspect("down")) end,
@@ -413,8 +545,12 @@ turtle = {
     forward = function() return move("forward") end,
     up = function() return move("up") end,
     down = function() return move("down") end,
-    turnRight = function() tick(); hd = (hd + 1) % 4; return true end,
-    turnLeft = function() tick(); hd = (hd + 3) % 4; return true end,
+    turnRight = function()
+        fault("before_turn"); tick(); hd=(hd+1)%4; fault("after_turn"); return true
+    end,
+    turnLeft = function()
+        fault("before_turn"); tick(); hd=(hd+3)%4; fault("after_turn"); return true
+    end,
     attack = function() return false end,
     attackUp = function() return false end,
     attackDown = function() return false end,
@@ -460,6 +596,7 @@ function results()
         fuel = fuel, wastedFuel = wastedFuel, gpsMovedSeen = gpsMovedSeen,
         moves = moveCount, minedCoalBurned = minedCoalBurned,
         outputCoal = outputItems["minecraft:coal"] or 0,
+        cutCount = cutIndex-1, printed = printed,
     }
 end
 '''
@@ -470,39 +607,57 @@ DEFAULTS = dict(fuel=0, limit=20000, fuelStock=64, outputCap=10 ** 9,
                 stopStatus="", gps=False)
 
 
+class Simulation:
+    def __init__(self, **options):
+        opts = dict(DEFAULTS)
+        opts.update(options)
+        self.opts = opts
+        self.lua = lua = LuaRuntime(unpack_returned_tuples=True)
+        lua.execute("OPTIONS = {}")
+        self.g = g = lua.globals()
+        for k, v in opts.items():
+            if isinstance(v, list):
+                t = lua.table()
+                for i, item in enumerate(v, 1):
+                    t[i] = lua.table(*item) if isinstance(item, (list, tuple)) else item
+                g.OPTIONS[k] = t
+            elif v is not None:
+                g.OPTIONS[k] = v
+        lua.execute(HARNESS)
+        code = (ROOT / "chunk_dig.lua").read_text()
+        for constant, option, default in [("OUTPUT_SIDE", "outputSide", "back"),
+                                          ("FUEL_SIDE", "fuelSide", "top")]:
+            code = code.replace(f'local {constant} = "{default}"',
+                                f'local {constant} = "{opts[option]}"')
+        # A fresh Lua closure per invocation, rather than repeatedly calling
+        # a saved execution stack. The mocked world/FS outlive each process.
+        self.code = code
+        g.quarry_source = code
+        lua.execute('shell = {execute=function(path, ...) '
+                    'assert(path=="/chunk_dig"); return assert(load(quarry_source))(...) end}')
+
+    def command(self, *args, startup=False):
+        code = (ROOT / "startup.lua").read_text() if startup else self.code
+        return self.g.launch(self.lua.eval("function(...) " + code + " end"), *args)
+
+    def start(self):
+        args = [str(self.opts.get("chunks", 1)), "Test Quarry"]
+        if self.opts.get("anchor"):
+            args.append(self.opts["anchor"])
+        return self.command(*args)
+
+    def results(self):
+        r = self.g.results()
+        out = {k: r[k] for k in r.keys()}
+        for k in ("violations", "statuses", "printed"):
+            out[k] = [r[k][i] for i in range(1, len(r[k]) + 1)]
+        return out
+
+
 def run(**options):
-    opts = dict(DEFAULTS)
-    opts.update(options)
-    lua = LuaRuntime(unpack_returned_tuples=True)
-    lua.execute("OPTIONS = {}")
-    g = lua.globals()
-    for k, v in opts.items():
-        if isinstance(v, list):
-            t = lua.table()
-            for i, item in enumerate(v, 1):
-                t[i] = lua.table(*item) if isinstance(item, (list, tuple)) else item
-            g.OPTIONS[k] = t
-        elif v is not None:
-            g.OPTIONS[k] = v
-    lua.execute(HARNESS)
-    code = (ROOT / "chunk_dig.lua").read_text()
-    if opts["outputSide"] != "back":
-        code = code.replace('local OUTPUT_SIDE = "back"',
-                            'local OUTPUT_SIDE = "%s"' % opts["outputSide"])
-    if opts["fuelSide"] != "top":
-        code = code.replace('local FUEL_SIDE = "top"',
-                            'local FUEL_SIDE = "%s"' % opts["fuelSide"])
-    program = lua.eval("function(...) " + code + " end")
-    try:
-        program(str(opts.get("chunks", 1)), "Test Quarry")
-    except Exception as error:
-        if "TEST_END" not in str(error):
-            raise
-    r = lua.globals().results()
-    out = {k: r[k] for k in r.keys()}
-    out["violations"] = [r["violations"][i] for i in range(1, len(r["violations"]) + 1)]
-    out["statuses"] = [r["statuses"][i] for i in range(1, len(r["statuses"]) + 1)]
-    return out
+    sim = Simulation(**options)
+    sim.start()
+    return sim.results()
 
 
 def check_complete(r, name):
@@ -640,6 +795,170 @@ def gps_marked_stale_after_moving():
     assert r["gpsMovedSeen"]
 
 
+def recover(sim, count):
+    outcome = sim.start()
+    manual = []
+    for _ in range(count):
+        assert outcome[0] == "POWER_CUT", (outcome, sim.results()["printed"][-6:])
+        outcome = sim.command(startup=True)
+        r = sim.results()
+        if r["last"]["status"] == "recovery_required":
+            assert not r["last"]["location"]["relative"]
+            seq, choice = sim.g.manual_choice()
+            manual.append(choice)
+            outcome = sim.command("resolve", str(seq), choice)
+    assert outcome[0] == "TEST_END", (outcome, sim.results()["printed"][-6:])
+    return check_complete(sim.results(), "restarted quarry"), manual
+
+
+@test
+def restart_at_moves_digs_turns_and_checkpoint_boundaries():
+    cuts = [
+        "before_turn", "after_turn", "before_action_write", "during_action_write",
+        "after_action_write", "before_action_publish", "after_action_publish",
+        "before_dig:mining", "after_dig:mining", "before_move:mining", "after_move:mining",
+        "before_move_down:mining", "after_move_down:mining",
+        "before_state_write:mining", "during_state_write:mining",
+        "after_state_write:mining", "before_state_publish:mining",
+        "after_state_publish:mining", "before_action_clear:mining",
+    ]
+    sim = Simulation(cuts=cuts)
+    r, choices = recover(sim, len(cuts))
+    assert r["cutCount"] == len(cuts)
+    # A published turn intent before the API runs can also require manual
+    # inspection. Definitely cover both actual sides of the turn boundary.
+    assert choices[:2] == ["before", "after"], choices
+    assert "recovering" in r["statuses"] and "resumed" in r["statuses"]
+    assert r["minedItems"] == r["outputMined"]
+
+
+@test
+def restart_during_partial_unload_refuel_and_all_travel_phases():
+    cuts = [
+        "before_suck:refueling", "after_suck:refueling",
+        "before_refuel:refueling", "after_refuel:refueling",
+        "before_move:returning_to_unload", "after_move:returning_to_unload",
+        "before_drop:unloading", "after_drop:unloading",
+        "before_move:resuming", "after_move:resuming",
+        "phase:returning_home", "before_move:returning_home", "after_move:returning_home",
+        "before_drop:unloading", "after_drop:unloading",
+    ]
+    sim = Simulation(cuts=cuts, manyItems=True, limit=1000, fuelStock=200,
+                     atm=[(0, -2, 0), (1, -3, 0)])
+    r, manual = recover(sim, len(cuts))
+    assert not manual
+    assert r["minedItems"] == r["outputMined"]
+    assert r["baseBurnsWrongSlot"] == 0 and r["fuelBurnsFromBase"] > 0
+    assert r["travelUpOffShaft"] > 0 and r["resumeChecks"] > 0
+
+
+@test
+def restart_waiting_for_storage_and_mid_job_fuel():
+    cuts = ["sleep:waiting_fuel", "sleep:waiting_output", "sleep:waiting_output"]
+    sim = Simulation(cuts=cuts, fuelStock=1, refillAt=3000,
+                     limit=1000, outputCap=750, outputGrowAt=5000)
+    r, manual = recover(sim, len(cuts))
+    assert not manual
+    assert r["statuses"].index("returning_to_refuel") < r["statuses"].index("waiting_fuel")
+    assert r["minedItems"] == r["outputMined"]
+
+
+@test
+def restart_after_partial_stack_transfer():
+    cuts = ["after_drop:unloading", "sleep:waiting_output"]
+    sim = Simulation(cuts=cuts, startItems=[("test:startup_cargo", 64)],
+                     outputCap=20, outputGrowAt=30)
+    r, manual = recover(sim, len(cuts))
+    assert not manual
+    assert r["minedItems"] + 64 == r["outputMined"]
+
+
+@test
+def resume_drains_a_previously_queued_move_before_reconciling():
+    sim = Simulation(cuts=["queue_move:mining"])
+    r, manual = recover(sim, 1)
+    assert not manual and r["minedItems"] == r["outputMined"]
+
+
+@test
+def gps_anchors_unlimited_moves_but_not_turns():
+    cuts = ["before_move:starting", "after_move:starting",
+            "before_move:mining", "after_move:mining", "after_turn:mining"]
+    sim = Simulation(cuts=cuts, fuel="unlimited", gps=True, anchor="east")
+    r, manual = recover(sim, len(cuts))
+    assert manual == ["after"], manual
+    assert r["minedItems"] == r["outputMined"]
+
+
+@test
+def unresolved_actions_refuse_to_move_and_can_be_verified_manually():
+    for options, alter in [({"fuel": "unlimited"}, None),
+                           ({}, ("power_change", -5)),
+                           ({"fuel": "unlimited", "gps": True, "anchor": "east"},
+                            ("gpsOffset", 10))]:
+        sim = Simulation(cuts=["after_move:mining"], **options)
+        assert sim.start()[0] == "POWER_CUT"
+        moves = sim.results()["moves"]
+        if alter:
+            name, value = alter
+            if name == "power_change":
+                sim.g.power_change(value)
+            else:
+                sim.g.OPTIONS[name] = value
+        assert sim.command(startup=True)[0] is None
+        r = sim.results()
+        assert r["last"]["status"] == "recovery_required" and r["moves"] == moves
+        assert r["last"]["location"]["uncertain"]
+        sim.command("status")
+        assert any("Before:" in line and "After:" in line for line in sim.results()["printed"])
+        if alter and alter[0] == "gpsOffset":
+            sim.g.OPTIONS.gpsOffset = 0
+        seq, which = sim.g.manual_choice()
+        assert sim.command("resolve", str(seq + 1), which)[0] is None
+        assert sim.results()["moves"] == moves
+        assert sim.command("resolve", str(seq), which)[0] == "TEST_END"
+        check_complete(sim.results(), "operator-verified resume")
+
+
+@test
+def absent_corrupt_torn_and_completed_checkpoints():
+    sim = Simulation()
+    sim.g.turtle.select(5)
+    assert sim.command(startup=True)[0] is None
+    assert sim.results()["selected"] == 5
+    sim.command("resume")
+    assert "No active quarry checkpoint" in sim.results()["printed"]
+    assert sim.results()["moves"] == 0 and sim.g.latest_record() is None
+
+    sim = Simulation(cuts=["during_state_write"])
+    assert sim.start()[0] == "POWER_CUT"
+    sim.command(startup=True)
+    assert sim.results()["last"]["status"] == "recovery_required"
+    assert sim.results()["moves"] == 0
+
+    for damage in ("corrupt_latest", "corrupt_action", "delete_latest", "different_version"):
+        sim = Simulation(cuts=["after_move:mining"])
+        assert sim.start()[0] == "POWER_CUT"
+        assert sim.g.latest_record() is not None
+        sim.g[damage]()
+        before = sim.results()["moves"]
+        sim.command(startup=True)
+        r = sim.results()
+        assert r["last"]["status"] == "recovery_required"
+        assert r["moves"] == before
+
+    sim = Simulation(cuts=["phase:complete"])
+    assert sim.start()[0] == "POWER_CUT"
+    before = check_complete(sim.results(), "completion committed")
+    assert sim.g.latest_record()["job"]["done"]
+    assert sim.command(startup=True)[0] is None
+    sim.command("resume")
+    sim.start()  # An explicit new job must also refuse to overwrite it.
+    r = sim.results()
+    assert r["moves"] == before["moves"] and r["outputMined"] == before["outputMined"]
+    assert "Saved job is completed" in r["printed"]
+
+
 def test_dashboard():
     lua = LuaRuntime(unpack_returned_tuples=True)
     lua.execute(r'''
@@ -697,8 +1016,21 @@ def test_dashboard():
                 assert(table.concat(lines, "\n"):find("OFFLINE"))
                 SAVED_WRITES = writes
                 return "timer", 1
+            elseif event == 5 then
+                assert(writes == SAVED_WRITES, "unchanged frame was redrawn")
+                local p=pkt(1,"recovery_required")
+                p.location={uncertain=true}
+                return "rednet_message",1,p,"turtle_quarry_v1"
+            elseif event == 6 then
+                local all=table.concat(lines,"\n")
+                assert(all:find("RECOVERY REQUIRED",1,true),all)
+                assert(all:find("Position / heading not verified",1,true),all)
+                return "rednet_message",1,pkt(1,"recovering"),"turtle_quarry_v1"
+            elseif event == 7 then
+                assert(table.concat(lines,"\n"):find("RECOVERING"))
+                return "rednet_message",1,pkt(1,"resumed"),"turtle_quarry_v1"
             end
-            assert(writes == SAVED_WRITES, "unchanged frame was redrawn")
+            assert(table.concat(lines,"\n"):find("RESUMED"))
             error("TEST_END")
         end
     ''')
