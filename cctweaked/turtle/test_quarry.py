@@ -119,6 +119,18 @@ function latest_record()
     if a and b then return a.seq>b.seq and a or b end
     return a or b
 end
+-- Fixture only: seed an otherwise valid, settled at-home base checkpoint
+-- as if the inbound route had arrived at this heading. No pending action.
+function base_heading_fixture(h)
+    local r=assert(latest_record())
+    local t=r.job.tasks[#r.job.tasks]
+    assert(t.kind=="base" and px==0 and py==0 and pz==0 and not fs.exists(saveDir .. "/action"))
+    hd,r.job.pos.h=h,h
+    local payload=textutils.serialize(r)
+    local a,b=1,0
+    for i=1,#payload do a=(a+payload:byte(i))%65521; b=(b+a)%65521 end
+    files[saveDir .. "/" .. r.seq%2]=("QUARRY 1 state %.0f\n"):format(a*65536+b) .. payload
+end
 function corrupt_latest()
     local r=latest_record()
     files[saveDir .. "/" .. r.seq%2]="QUARRY 1 state 0\n{broken"
@@ -201,6 +213,7 @@ for _, c in ipairs(O.atm or {}) do atm[key(c[1], c[2], c[3])] = true end
 
 local function blockAt(x, y, z)
     local k = key(x, y, z)
+    if storage[k]=="dock" then return "computercraft:wired_modem_full" end
     if storage[k] then return storage[k]=="shared" and "modded:item_storage" or "minecraft:barrel" end
     if removed[k] then return nil end
     if y >= 0 then return nil end
@@ -436,6 +449,9 @@ local function kindOnSide(side)
     local kind=invAt("forward"); hd=save
     return kind
 end
+local function upgradeMasks(side)
+    return O.maskUpgradeSides and (side=="left" or side=="right")
+end
 
 local function wireCall(name,method,id,from,amount,into)
     assert(name==BARREL)
@@ -480,6 +496,7 @@ local function wireCall(name,method,id,from,amount,into)
 end
 
 local function wrapSide(side)
+    if upgradeMasks(side) then return {isWireless=function() return true end} end
     if kindOnSide(side)=="dock" then
         if O.noDock then return nil end
         return {
@@ -550,13 +567,17 @@ peripheral = {
     end,
     getName = function() return "right" end,
     getType = function(side)
+        if upgradeMasks(side) then return "modem" end
         local k=kindOnSide(side)
+        if k=="shared" and O.noOutputCapability then return O.nonInventoryPeripheral end
         if k=="shared" then return "modded:item_storage","inventory" end
         if k=="fuel" or k=="output" then return "minecraft:barrel","inventory" end
+        if k=="dock" and not O.noDock then return "modem" end
     end,
     hasType = function(side,kind)
         local k=kindOnSide(side)
-        return kind=="inventory" and not O.noOutputCapability and (k=="shared" or k=="output" or k=="fuel")
+        return kind=="inventory" and not upgradeMasks(side) and not O.noOutputCapability
+            and (k=="shared" or k=="output" or k=="fuel")
     end,
     wrap = function(side) return wrapSide(side) end,
 }
@@ -1002,6 +1023,98 @@ def restart_after_partial_stack_transfer():
     r, manual = recover(sim, len(cuts))
     assert not manual
     assert r["minedItems"] + 64 == r["outputMined"]
+
+
+@test
+def shared_base_entry_and_reboot_from_every_heading():
+    for heading, side in enumerate(("back", "right", "front", "left")):
+        sim = Simulation(fuelSide="back", fuelStock=2, limit=1600,
+                         startItems=[("test:carried", 3)], noOutputCapability=True,
+                         maskUpgradeSides=True, stopStatus="waiting_output", cuts=[])
+        assert sim.start()[0] == "TEST_END"
+        sim.g.base_heading_fixture(heading)
+        sim.g.OPTIONS.noOutputCapability = False
+        before = sim.g.latest_record()["seq"]
+        sim.command("status")
+        r = sim.results()
+        assert any(f"home back -> current {side} at heading {heading}" in p for p in r["printed"])
+        assert r["heading"] == heading and sim.g.latest_record()["seq"] == before
+
+        # If a physical turn is needed, abandon it after its new heading
+        # was committed but before the journal was cleared. Otherwise
+        # interrupt immediately before cargo transfer from the aligned pose.
+        sim.g.OPTIONS.cuts[1] = "before_drop" if heading == 2 else "before_action_clear"
+        sim.g.OPTIONS.cuts[2] = "after_drop"
+        sim.g.OPTIONS.cuts[3] = "before_dig"
+        assert sim.command(startup=True)[0] == "POWER_CUT"
+        r = sim.results()
+        assert r["moves"] == 0 and r["invItems"] == 3
+        assert r["heading"] == sim.g.latest_record()["job"]["pos"]["h"]
+        assert sim.command(startup=True)[0] == "POWER_CUT"
+        r = sim.results()
+        assert r["heading"] == 2 and r["outputMined"] == 3 and r["invItems"] == 0
+        assert sim.command(startup=True)[0] == "POWER_CUT"
+        r = sim.results()
+        assert r["heading"] == 0 and r["wirePushes"] == 2 and r["fuel"] == 1600
+        assert r["outputMined"] == 3 and r["selected"] == 1 and not r["violations"]
+        assert "recovery_required" not in r["statuses"]
+
+
+@test
+def shared_base_diagnostic_distinguishes_block_from_capability():
+    for missing, expected in [(False, "block=modded:item_storage; peripheral=display; inventory=false"),
+                              (True, "block=No block to inspect; peripheral=none; inventory=false")]:
+        sim = Simulation(fuelSide="back", noOutput=missing, noOutputCapability=True,
+                         nonInventoryPeripheral="display", stopStatus="waiting_output",
+                         startItems=[("test:carried", 3)])
+        assert sim.start()[0] == "TEST_END"
+        sim.g.base_heading_fixture(3)
+        assert sim.command(startup=True)[0] == "TEST_END"
+        r = sim.results()
+        assert r["last"]["status"] == "waiting_output"
+        assert "home back -> current front at heading 2" in r["last"]["detail"]
+        assert expected in r["last"]["detail"]
+        assert r["heading"] == 2 and r["invItems"] == 3 and r["lost"] == r["moves"] == 0
+
+
+@test
+def shared_base_interrupted_uncommitted_turn_never_guesses_heading():
+    sim = Simulation(fuelSide="back", noOutputCapability=True, maskUpgradeSides=True,
+                     stopStatus="waiting_output", cuts=[], startItems=[("test:carried", 3)])
+    assert sim.start()[0] == "TEST_END"
+    sim.g.base_heading_fixture(3)
+    sim.g.OPTIONS.noOutputCapability = False
+    sim.g.OPTIONS.cuts[1] = "after_turn"
+    sim.g.OPTIONS.cuts[2] = "after_drop"
+    assert sim.command(startup=True)[0] == "POWER_CUT"
+    assert sim.results()["heading"] == 2 and sim.g.latest_record()["job"]["pos"]["h"] == 3
+    sim.command(startup=True)
+    r = sim.results()
+    assert r["last"]["status"] == "recovery_required" and r["heading"] == 2
+    assert r["moves"] == r["outputMined"] == 0 and r["invItems"] == 3
+    seq, choice = sim.g.manual_choice()
+    assert choice == "after"
+    assert sim.command("resolve", str(seq), choice)[0] == "POWER_CUT"
+    r = sim.results()
+    assert r["heading"] == 2 and r["moves"] == 0 and r["outputMined"] == 3
+    assert sim.g.latest_record()["job"]["pos"]["h"] == 2 and not r["violations"]
+
+
+@test
+def shared_top_storage_faces_home_front_for_its_wired_dock():
+    sim = Simulation(outputSide="top", fuelSide="top", limit=1600, fuelStock=2,
+                     maskUpgradeSides=True, noOutputCapability=True,
+                     stopStatus="waiting_output", cuts=[], startItems=[("test:carried", 3)])
+    assert sim.start()[0] == "TEST_END"
+    sim.g.base_heading_fixture(3)
+    sim.g.OPTIONS.noOutputCapability = False
+    sim.g.OPTIONS.cuts[1] = "before_wire_push"
+    sim.g.OPTIONS.cuts[2] = "before_dig"
+    assert sim.command(startup=True)[0] == "POWER_CUT"
+    assert sim.results()["heading"] == 0 and sim.results()["outputMined"] == 3
+    assert sim.command(startup=True)[0] == "POWER_CUT"
+    r = sim.results()
+    assert r["fuel"] == 1600 and r["wirePushes"] == 2 and not r["violations"]
 
 
 @test

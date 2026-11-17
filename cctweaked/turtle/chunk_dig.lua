@@ -451,6 +451,12 @@ local function face(h)
     motion(d == 3 and "left" or "right")
     return false -- one motion per dispatcher step
 end
+local function faceSide(which)
+    return which=="top" or face(sides[which])
+end
+local function physicalSide(which)
+    return which=="top" and "top" or sideNames[(sides[which]-S.pos.h)%4]
+end
 local function direction(p)
     local c=S.pos
     if not adjacent(c,p) then fail("Route step is not adjacent") end
@@ -601,14 +607,30 @@ local function carriedBlocks(need)
         end
     end
 end
-local function invSide(which) return which == "top" and "top" or "front" end
-local function inventoryAt(which)
-    local p=peripheral.wrap(invSide(which))
-    return p and type(p.list)=="function"
+local function inventoryAt(which, generic)
+    local side=physicalSide(which)
+    if generic then return peripheral.hasType(side,"inventory") end
+    local p=peripheral.wrap(side)
+    return p and type(p.list)=="function" and p or nil
+end
+local function sideProbe(which)
+    local side=physicalSide(which)
+    local inspect=side=="front" and turtle.inspect or side=="top" and turtle.inspectUp
+    local block="not inspected (requires front or top)"
+    if inspect then
+        local ok,detail=inspect()
+        block=ok and detail.name or tostring(detail)
+    end
+    local types={peripheral.getType(side)}
+    return ("home %s -> current %s at heading %d; block=%s; peripheral=%s; inventory=%s")
+        :format(which,side,S.pos.h,block,#types>0 and table.concat(types,",") or "none",
+            tostring(not not peripheral.hasType(side,"inventory")))
 end
 local function drop(which,i)
+    local side=physicalSide(which)
+    if side~="front" and side~="top" then fail("Output transfer attempted before facing storage") end
     turtle.select(i)
-    local ok,why=(which == "top" and turtle.dropUp or turtle.drop)()
+    local ok,why=(side=="top" and turtle.dropUp or turtle.drop)()
     turtle.select(1)
     if turtle.getItemCount(i)==0 then return true end
     if ok or tostring(why):lower():find("space") then return false,"output inventory full" end
@@ -631,27 +653,21 @@ local function baseWait(t,stage,message)
     waitFor(stage,message)
 end
 
-local function localSide(which)
-    return which=="top" and "top" or sideNames[(sides[which]-S.pos.h)%4]
-end
 local function wireCall(fn,...)
     local ok,value=pcall(fn,...)
     if ok then return value end
     if value=="Terminated" then fail(value) end
     return nil,tostring(value)
 end
-local function sharedOutputAt(which)
-    -- A solid block or an arbitrary peripheral is not enough: turtle.drop
-    -- can eject items into the world when there is no adjacent item handler.
-    return peripheral.hasType(localSide(which),"inventory")
-end
+local function fuelDockSide(which) return which=="top" and "front" or "top" end
 local function fuelDock(which)
-    local dockSide=localSide(which=="top" and "front" or "top")
+    local dockHomeSide=fuelDockSide(which)
+    local dockSide=physicalSide(dockHomeSide)
     local m=peripheral.wrap(dockSide)
     if not m or type(m.isWireless)~="function" or m.isWireless()
         or type(m.getNameLocal)~="function" or type(m.getNamesRemote)~="function"
         or type(m.getMethodsRemote)~="function" or type(m.callRemote)~="function" then
-        return nil,"selective fuel requires a wired dock modem (" .. dockSide .. ") with remote inventory calls"
+        return nil,"selective fuel requires a wired dock modem with remote inventory calls; " .. sideProbe(dockHomeSide)
     end
     local id=wireCall(m.getNameLocal)
     if type(id)~="string" or id=="" then
@@ -795,8 +811,13 @@ local function sharedBase(t)
         carriedBlocks(t.need)
         carried(t.need)
     end
-    if not sharedOutputAt(S.output) then
-        waitFor("waiting_output","no adjacent item inventory capability on the " .. S.output .. " side of home")
+    -- Check horizontally mounted storage through the front, not through
+    -- an upgrade side that can mask an adjacent peripheral. With a top
+    -- inventory, face home-front so its wired dock is not masked either.
+    if not faceSide(S.output=="top" and fuelDockSide(S.output) or S.output) then return end
+    -- A block on its own does not establish a usable adjacent inventory.
+    if not inventoryAt(S.output,true) then
+        waitFor("waiting_output","no adjacent item inventory capability: " .. sideProbe(S.output))
         return
     end
     if t.stage=="validate_output" or t.stage=="validate_fuel" or t.stage=="invalid_base" then
@@ -808,9 +829,8 @@ local function sharedBase(t)
         local n=turtle.getItemCount(i)
         if n>0 then
             hasCargo=true
-            if S.output~="top" and not face(sides[S.output]) then return end
-            if not sharedOutputAt(S.output) then
-                baseWait(t,"waiting_output","adjacent inventory capability disappeared; cargo retained")
+            if not inventoryAt(S.output,true) then
+                baseWait(t,"waiting_output","adjacent inventory capability disappeared; cargo retained; " .. sideProbe(S.output))
                 return
             end
             local _,err=drop(S.output,i)
@@ -1041,10 +1061,10 @@ handlers.base = function(t)
     if t.stage=="validate_output" or t.stage=="validate_fuel" then
         local output=t.stage=="validate_output"
         local which=output and S.output or S.fuel
-        if not face(which=="top" and 0 or sides[which]) then return end
+        if not faceSide(which) then return end
         if not inventoryAt(which) then
             t.stage="invalid_base"
-            t.problem="no " .. (output and "output" or "fuel") .. " inventory on " .. which .. " side of home"
+            t.problem="no " .. (output and "output" or "fuel") .. " inventory on " .. which .. " side of home; " .. sideProbe(which)
             return true
         end
         t.stage=output and "validate_fuel" or "unload"
@@ -1059,10 +1079,10 @@ handlers.base = function(t)
         local slot
         for i=1,16 do if turtle.getItemCount(i)>0 then slot=i; break end end
         if slot then
-            if S.output~="top" and not face(sides[S.output]) then return end
+            if not faceSide(S.output) then return end
             local ok,why
             if inventoryAt(S.output) then ok,why=drop(S.output,slot)
-            else why="output inventory missing (" .. S.output .. ")" end
+            else why="output inventory missing; " .. sideProbe(S.output) end
             if not ok then
                 baseWait(t,"waiting_output",why)
             end
@@ -1079,10 +1099,10 @@ handlers.base = function(t)
         local d=turtle.getItemDetail(1)
         if d.name=="minecraft:coal_block" and fuel()<limit() and burn(1) then return end
         -- Keep wrong/leftover items, even if the output fills during refuel.
-        if S.output~="top" and not face(sides[S.output]) then return end
+        if not faceSide(S.output) then return end
         local ok,why
         if inventoryAt(S.output) then ok,why=drop(S.output,1)
-        else why="output inventory missing (" .. S.output .. ")" end
+        else why="output inventory missing; " .. sideProbe(S.output) end
         if not ok then waitFor("waiting_output",why)
         elseif d.name~="minecraft:coal_block" then
             baseWait(t,"waiting_fuel","Fuel inventory must contain only coal blocks")
@@ -1092,14 +1112,15 @@ handlers.base = function(t)
     if fuel()>=limit() or (fuel()>=t.need and limit()-fuel()<fuelValues["minecraft:coal_block"]) then
         t.stage="orient"; return true
     end
-    if S.fuel~="top" and not face(sides[S.fuel]) then return end
-    if not inventoryAt(S.fuel) then
+    if not faceSide(S.fuel) then return end
+    local sourceInventory=inventoryAt(S.fuel)
+    if not sourceInventory then
         if fuel()>=t.need then t.stage="orient"; return true end
-        baseWait(t,"waiting_fuel","fuel inventory missing (" .. S.fuel .. ")")
+        baseWait(t,"waiting_fuel","fuel inventory missing; " .. sideProbe(S.fuel))
         return
     end
     turtle.select(1)
-    local list=peripheral.wrap(invSide(S.fuel)).list()
+    local list=sourceInventory.list()
     local source=next(list)
     local ok,why=(S.fuel=="top" and turtle.suckUp or turtle.suck)(1)
     turtle.select(1)
@@ -1386,6 +1407,10 @@ local function run()
         local j=actionRecord()
         if j and j.seq==generation then
             print(("Pending %s #%d\nBefore: %s\nAfter: %s"):format(j.op,j.seq,describe(j.before),describe(j.after)))
+        elseif same(S.pos,HOME) then
+            print("Output check (using saved heading): " .. sideProbe(S.output))
+            local which=S.output==S.fuel and fuelDockSide(S.output) or S.fuel
+            print((S.output==S.fuel and "Fuel dock check" or "Fuel check") .. " (using saved heading): " .. sideProbe(which))
         end
         return
     end
@@ -1401,7 +1426,9 @@ local function run()
         if j and j.seq==generation then recovery("Resolve the pending action before migrating; run chunk_dig status") end
         reconcile() -- drain queued commands and verify GPS if configured; no motion
         verifiedPose=true
-        if not sharedOutputAt("back") then fail("Migration not saved: no adjacent item inventory capability behind home") end
+        if not inventoryAt("back",true) then
+            fail("Migration not saved: no adjacent item inventory capability; " .. sideProbe("back"))
+        end
         S.fuel,S.sharedMigration="back",generation
         checkpoint()
         print("Saved shared back/back configuration; run chunk_dig resume")
