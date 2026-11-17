@@ -39,6 +39,10 @@ local cargoDetail, wastedFuel = false, 0
 local outputCap = O.outputCap
 local outputItems, outputTotal = {}, 0
 local fuelInv = {}
+local shared, barrel = O.outputSide==O.fuelSide, {}
+local barrelSize, wirePushes, blindSucks, wrongPushes = O.barrelSize or 27, 0,0,0
+local BLOCK, BARREL = "minecraft:coal_block", "minecraft:barrel_0"
+local barrelRemoved, pulledFrom, pushedInto = {}, {}, {}
 local pendingResume = nil
 local resumeChecks, resumeFails = 0, 0
 local inTrip = false
@@ -153,10 +157,36 @@ local function addStorage(side, kind)
     local o = SIDE_OFF[side]
     storage[key(o[1], o[2], o[3])] = kind
 end
-if not O.noOutput then addStorage(O.outputSide, "output") end
-if not O.noFuelInv then addStorage(O.fuelSide, "fuel") end
-if O.fuelStock > 0 then
+local function barrelStock(count)
+    for i=1,barrelSize do
+        if not barrel[i] then barrel[i]={name=BLOCK,count=count}; return end
+    end
+end
+if shared then
+    if not O.noOutput then addStorage(O.outputSide,"shared") end
+    addStorage(O.outputSide=="top" and "front" or "top","dock")
+    for _,s in ipairs(O.barrelItems or {}) do barrel[s[1]]={name=s[2],count=s[3]} end
+    if O.fuelStock>0 then barrelStock(O.fuelStock) end
+else
+    if not O.noOutput then addStorage(O.outputSide, "output") end
+    if not O.noFuelInv then addStorage(O.fuelSide, "fuel") end
+end
+if not shared and O.fuelStock > 0 then
     fuelInv[1] = {name = "minecraft:coal_block", count = O.fuelStock}
+end
+function enable_shared()
+    shared=true
+    addStorage("back","shared")
+    addStorage("top","dock")
+    barrelStock(64)
+end
+function drain_barrel()
+    for i,d in pairs(barrel) do
+        if d.name~=BLOCK then
+            barrelRemoved[d.name]=(barrelRemoved[d.name] or 0)+d.count
+            barrel[i]=nil
+        end
+    end
 end
 
 local function bedrockY(x, z)
@@ -204,7 +234,8 @@ local function tick(n)
     if O.outputGrowAt and T >= O.outputGrowAt then outputCap = 10 ^ 9 end
     if O.refillAt and T >= O.refillAt and not O.refilled then
         O.refilled = true
-        fuelInv[1] = {name = "minecraft:coal_block", count = 64}
+        if shared then barrelStock(64)
+        else fuelInv[1] = {name = "minecraft:coal_block", count = 64} end
     end
 end
 
@@ -332,6 +363,7 @@ local function drop(dir, count)
     local s = slots[selected]
     if not s then return false, "No items to drop" end
     local kind = invAt(dir)
+    if shared then v("native drop used in shared mode"); return false end
     if not kind then
         lost = lost + s.count
         v("dropped items into the world")
@@ -361,6 +393,7 @@ local function suck(dir, count)
     fault("before_suck")
     tick()
     local kind = invAt(dir)
+    if shared then blindSucks=blindSucks+1; v("native suck used in shared mode"); return false end
     if kind ~= "fuel" then return false, "No items to take" end
     for i, st in ipairs(fuelInv) do
         if st.count > 0 then
@@ -375,13 +408,88 @@ local function suck(dir, count)
     return false, "No items to take"
 end
 
-local function sideToDir(side)
-    if side == "top" then return "up" end
-    if side == "bottom" then return "down" end
-    return side
+local function kindOnSide(side)
+    local turn = ({front=0,right=1,back=2,left=3})[side]
+    if side=="top" then return invAt("up") end
+    if side=="bottom" then return invAt("down") end
+    if turn==nil then return end
+    local save=hd; hd=(hd+turn)%4
+    local kind=invAt("forward"); hd=save
+    return kind
+end
+
+local function wireCall(name,method,id,from,amount,into)
+    assert(name==BARREL)
+    tick()
+    if method=="list" then
+        local out={}
+        for i,d in pairs(barrel) do out[i]={name=d.name,count=d.count} end
+        return out
+    end
+    if method=="getItemDetail" then
+        local d=barrel[id]
+        return d and {name=d.name,count=d.count}
+    end
+    assert(id=="turtle_4")
+    requireSlot1("wired inventory transfer")
+    if method=="pushItems" then
+        fault("before_wire_push")
+        assert(amount==1 and slots[into]==nil and barrel[from])
+        local d=barrel[from]
+        assert(d.name==BLOCK)
+        if O.wirePushFails then return 0 end
+        local item=d.name
+        if O.wireRace then item="minecraft:gravel"; O.wireRace=false; wrongPushes=wrongPushes+1 end
+        d.count=d.count-1
+        if d.count==0 then barrel[from]=nil end
+        slots[into]={name=item,count=1}
+        wirePushes=wirePushes+1
+        pulledFrom[wirePushes],pushedInto[wirePushes]=from,into
+        fault("after_wire_push")
+        return 1
+    end
+    assert(method=="pullItems" and into==nil)
+    fault("before_wire_pull")
+    if O.wirePullFails then error("wired output failed") end
+    local d=slots[from]
+    assert(d and amount==d.count)
+    local moved=0
+    for pass=1,2 do
+        for i=1,barrelSize do
+            local b=barrel[i]
+            if (pass==1 and b and b.name==d.name) or (pass==2 and not b) then
+                local n=math.min(amount-moved,64-(b and b.count or 0))
+                if n>0 then barrel[i]={name=d.name,count=(b and b.count or 0)+n}; moved=moved+n end
+            end
+        end
+    end
+    if moved>0 then
+        outputItems[d.name]=(outputItems[d.name] or 0)+moved
+        d.count=d.count-moved
+        if d.count==0 then slots[from]=nil end
+        fault("after_wire_pull")
+    end
+    return moved
 end
 
 local function wrapSide(side)
+    if kindOnSide(side)=="dock" then
+        if O.noDock then return nil end
+        return {
+            isWireless=function() return false end,
+            getNameLocal=function() return not O.dockOff and "turtle_4" or nil end,
+            getNamesRemote=function()
+                if O.noWiredBarrel then return {"speaker_0"} end
+                if O.twoWiredBarrels then return {BARREL,"minecraft:barrel_1","speaker_0"} end
+                return {BARREL,"speaker_0"}
+            end,
+            getMethodsRemote=function(name)
+                assert(name==BARREL)
+                return {"list","getItemDetail","pushItems","pullItems"}
+            end,
+            callRemote=wireCall,
+        }
+    end
     local dir
     if side == "front" then dir = "forward"
     elseif side == "top" then dir = "up"
@@ -430,6 +538,10 @@ peripheral = {
         return nil
     end,
     getName = function() return "right" end,
+    getType = function(side)
+        local k=kindOnSide(side)
+        if k=="shared" or k=="fuel" or k=="output" then return "minecraft:barrel","inventory" end
+    end,
     wrap = function(side) return wrapSide(side) end,
 }
 rednet = {
@@ -597,6 +709,8 @@ function results()
         moves = moveCount, minedCoalBurned = minedCoalBurned,
         outputCoal = outputItems["minecraft:coal"] or 0,
         cutCount = cutIndex-1, printed = printed,
+        wirePushes=wirePushes, blindSucks=blindSucks, wrongPushes=wrongPushes,
+        barrel=barrel, barrelRemoved=barrelRemoved, pulledFrom=pulledFrom, pushedInto=pushedInto,
     }
 end
 '''
@@ -626,7 +740,7 @@ class Simulation:
         lua.execute(HARNESS)
         code = (ROOT / "chunk_dig.lua").read_text()
         for constant, option, default in [("OUTPUT_SIDE", "outputSide", "back"),
-                                          ("FUEL_SIDE", "fuelSide", "top")]:
+                                          ("FUEL_SIDE", "fuelSide", "back")]:
             code = code.replace(f'local {constant} = "{default}"',
                                 f'local {constant} = "{opts[option]}"')
         # A fresh Lua closure per invocation, rather than repeatedly calling
@@ -871,6 +985,191 @@ def restart_after_partial_stack_transfer():
     r, manual = recover(sim, len(cuts))
     assert not manual
     assert r["minedItems"] + 64 == r["outputMined"]
+
+
+@test
+def shared_slot_selective_transfers_survive_restarts():
+    # Sparse mixed barrel: existing cargo and a larger coal stack both
+    # precede the one-block stack. The first pull must select slot 17.
+    cuts = ["before_wire_pull", "after_wire_pull", "before_wire_push",
+            "after_wire_push", "before_refuel", "after_refuel"]
+    sim = Simulation(fuelSide="back", cuts=cuts, fuelStock=0, manyItems=True,
+                     startItems=[("test:startup_cargo", 64)],
+                     barrelSize=80,  # isolate quarry coverage from 27-slot capacity
+                     barrelItems=[(1, "test:untouched", 62), (12, "minecraft:coal_block", 63),
+                                  (17, "minecraft:coal_block", 1)])
+    r, manual = recover(sim, len(cuts))
+    assert not manual and r["cutCount"] == len(cuts)
+    assert r["pulledFrom"][1] == 17 and r["pushedInto"][1] == 1
+    assert r["barrel"][1]["name"] == "test:untouched" and r["barrel"][1]["count"] == 62
+    assert r["fuelBurnsFromBase"] == r["wirePushes"] and not r["blindSucks"]
+    assert r["fuel"] + r["moves"] == 800 * r["wirePushes"]
+    assert r["minedItems"] + 64 == r["outputMined"]
+    assert r["maxUsed"] == 16 and r["resumeChecks"] > 0
+
+
+@test
+def shared_full_barrel_burns_carried_coal_and_uses_another_buffer_slot():
+    coal = "minecraft:coal_block"
+    sim = Simulation(fuelSide="back", fuel=159, limit=1760, fuelStock=0,
+                     barrelItems=[(1, "test:keep", 64), (2, coal, 1)],
+                     barrelSize=2, startItems=[("test:carried", 3), (coal, 1)],
+                     cuts=["after_wire_push", "phase:mining"])
+    assert sim.start()[0] == "POWER_CUT"
+    before = sim.results()
+    assert before["fuel"] == 959 and before["pushedInto"][1] == 2
+    assert before["outputMined"] == 0 and before["barrel"][2] is None
+    assert sim.command(startup=True)[0] == "POWER_CUT"
+    r = sim.results()
+    assert r["fuel"] + r["moves"] == 1759 and r["outputMined"] == 3
+    assert r["fuelBurnsFromBase"] == 2 and r["wirePushes"] == 1
+    assert r["barrel"][1]["count"] == 64 and r["selected"] == 1 and not r["violations"]
+
+
+@test
+def shared_full_barrel_frees_a_slot_by_burning_fuel():
+    sim = Simulation(fuelSide="back", fuel=0, limit=1600, fuelStock=0,
+                     barrelItems=[(1, "test:keep", 64), (2, "minecraft:coal_block", 1)],
+                     barrelSize=2, startItems=[("test:carried", 3)],
+                     cuts=["after_wire_push", "phase:mining"])
+    assert sim.start()[0] == "POWER_CUT"
+    assert sim.results()["pushedInto"][1] == 2
+    assert sim.command(startup=True)[0] == "POWER_CUT"
+    r = sim.results()
+    assert r["outputMined"] == 3 and r["fuel"] + r["moves"] == 800 and r["wirePushes"] == 1
+    assert r["barrel"][1]["count"] == 64 and r["barrel"][2]["name"] == "test:carried"
+    assert r["selected"] == 1 and not r["violations"]
+
+
+@test
+def shared_full_turtle_can_burn_a_whole_stack_to_open_a_buffer():
+    sim = Simulation(fuelSide="back", fuel=200, limit=1800, fuelStock=0,
+                     barrelItems=[(1, "test:keep", 64), (2, "minecraft:coal_block", 64)],
+                     barrelSize=2, cuts=["after_wire_push"],
+                     startItems=[(f"test:carried_{i}", 1) for i in range(15)] +
+                                [("minecraft:coal_block", 1)])
+    assert sim.start()[0] == "POWER_CUT"
+    r = sim.results()
+    assert r["fuel"] == 1000 and r["pushedInto"][1] == 16
+    assert r["barrel"][2]["count"] == 63 and r["invItems"] == 16
+    assert r["outputMined"] == r["moves"] == 0 and not r["violations"]
+
+
+@test
+def shared_partial_unload_retries_only_the_remaining_cargo():
+    sim = Simulation(fuelSide="back", fuel="unlimited", fuelStock=0, barrelSize=1,
+                     barrelItems=[(1, "test:carried", 63)],
+                     startItems=[("test:carried", 4)], stopStatus="waiting_output",
+                     cuts=["after_wire_pull", "before_dig"])
+    assert sim.start()[0] == "POWER_CUT"
+    r = sim.results()
+    assert r["outputMined"] == 1 and r["invItems"] == 3 and r["barrel"][1]["count"] == 64
+    assert sim.command(startup=True)[0] == "TEST_END"
+    assert sim.results()["last"]["status"] == "waiting_output"
+    sim.g.drain_barrel()
+    assert sim.command(startup=True)[0] == "POWER_CUT"
+    r = sim.results()
+    assert r["outputMined"] == 4 and r["invItems"] == 0
+    assert r["barrel"][1]["count"] == 3 and r["barrelRemoved"]["test:carried"] == 64
+    assert r["wirePushes"] == 0 and not r["violations"]
+
+
+@test
+def shared_waits_for_coal_and_failed_transfers_then_resumes():
+    sim = Simulation(fuelSide="back", fuelStock=0, stopStatus="waiting_fuel",
+                     barrelItems=[(1, "minecraft:coal", 12)],
+                     startItems=[("test:carried", 1)], wirePullFails=True,
+                     cuts=["sleep:waiting_output"])
+    assert sim.start()[0] == "POWER_CUT"
+    assert "wired output failed" in sim.results()["last"]["detail"]
+    sim.g.OPTIONS.wirePullFails = False
+    assert sim.command(startup=True)[0] == "TEST_END"
+    r = sim.results()
+    assert "no coal blocks" in r["last"]["detail"] and r["wirePushes"] == 0
+    assert r["outputMined"] == 1 and r["moves"] == 0
+    sim.g.OPTIONS.refillAt = 1
+    sim.g.OPTIONS.wirePushFails = True
+    assert sim.command(startup=True)[0] == "TEST_END"
+    assert "did not reach slot" in sim.results()["last"]["detail"]
+    sim.g.OPTIONS.wirePushFails = False
+    assert sim.command(startup=True)[0] == "TEST_END"
+    r = check_complete(sim.results(), "shared refill")
+    assert r["barrel"][1]["name"] == "minecraft:coal" and r["barrel"][1]["count"] == 12
+    assert r["minedItems"] + 1 == r["outputMined"] and r["wirePushes"] > 0
+
+
+@test
+def shared_waits_safely_for_output_space_or_dock():
+    for opts, detail in [
+        (dict(noDock=True), "wired dock modem"),
+        (dict(twoWiredBarrels=True), "more than one barrel"),
+        (dict(fuel="unlimited"), "fuel tank has no room"),
+        (dict(startItems=[(f"test:carried_{i}", 1) for i in range(16)]), "all 16 turtle slots occupied"),
+    ]:
+        opts.setdefault("startItems", [("test:carried", 1)])
+        r = run(fuelSide="back", fuelStock=1, stopStatus="waiting_output", barrelSize=1, **opts)
+        assert detail in r["last"]["detail"] and r["last"]["status"] == "waiting_output"
+        assert r["moves"] == r["wirePushes"] == r["outputMined"] == 0
+        assert r["invItems"] == len(opts["startItems"]) and r["selected"] == 1
+        assert not r["blindSucks"] and not r["violations"]
+    sim = Simulation(fuelSide="back", fuelStock=0, fuel="unlimited",
+                     barrelItems=[(i, "test:full", 64) for i in range(1, 28)],
+                     startItems=[("test:carried", 1)], stopStatus="waiting_output")
+    assert sim.start()[0] == "TEST_END"
+    assert sim.results()["last"]["status"] == "waiting_output"
+    sim.g.drain_barrel()
+    assert sim.command(startup=True)[0] == "TEST_END"
+    r = check_complete(sim.results(), "shared output cleared")
+    assert r["minedItems"] + 1 == r["outputMined"]
+
+
+@test
+def shared_changed_source_fails_closed_without_redepositing():
+    sim = Simulation(fuelSide="back", fuelStock=1, wireRace=True, cuts=["after_wire_push"])
+    assert sim.start()[0] == "POWER_CUT"
+    for _ in range(2):
+        sim.command(startup=True)
+        r = sim.results()
+        assert r["last"]["status"] == "recovery_required"
+        assert "Unexpected item in shared fuel buffer" in r["last"]["detail"]
+        assert r["wirePushes"] == r["wrongPushes"] == r["invItems"] == 1
+        assert r["outputMined"] == r["moves"] == r["blindSucks"] == 0
+        assert r["selected"] == 1 and not r["violations"]
+
+
+@test
+def shared_migration_is_explicit_home_only_and_restart_safe():
+    sim = Simulation(fuelStock=0, stopStatus="waiting_fuel", cuts=[])
+    # Wait on an ordinary published legacy checkpoint first, then arm
+    # interruptions specifically for the migration.
+    assert sim.start()[0] == "TEST_END"
+    sim.code = sim.code.replace('local FUEL_SIDE = "top"', 'local FUEL_SIDE = "back"')
+    sim.g.quarry_source = sim.code
+    assert sim.command(startup=True)[0] == "TEST_END"
+    assert sim.g.latest_record()["job"]["fuel"] == "top"
+    sim.command("migrate-shared")
+    assert sim.g.latest_record()["job"]["fuel"] == "top"
+    sim.g.enable_shared()
+    # Error telemetry changed the last status; unqualified hooks here only
+    # fire when the explicitly invoked migration actually writes.
+    sim.lua.execute('OPTIONS.cuts[1]="before_state_publish"; OPTIONS.cuts[2]="after_state_publish"')
+    assert sim.command("migrate-shared")[0] == "POWER_CUT"
+    assert sim.g.latest_record()["job"]["fuel"] == "top"
+    assert sim.command("migrate-shared")[0] == "POWER_CUT"
+    job = sim.g.latest_record()["job"]
+    assert job["fuel"] == "back" and job["barrel"] == "minecraft:barrel_0"
+    assert sim.results()["moves"] == 0
+    assert sim.command(startup=True)[0] == "TEST_END"
+    check_complete(sim.results(), "migrated legacy checkpoint")
+
+    for cut, detail in [("before_turn", "Resolve the pending action"),
+                        ("after_state_publish:mining", "original home")]:
+        away = Simulation(cuts=[cut])
+        assert away.start()[0] == "POWER_CUT"
+        before = away.results()["moves"]
+        away.command("migrate-shared")
+        assert detail in away.results()["last"]["detail"], away.results()["last"]["detail"]
+        assert away.g.latest_record()["job"]["fuel"] == "top" and away.results()["moves"] == before
 
 
 @test
