@@ -4,6 +4,7 @@ Lua programs for [CC: Tweaked](https://tweaked.cc/) Advanced Computers and Pocke
 
 - [`powah/`](powah/) — Powah reactor (and thermo generator) monitoring.
 - [`draconic_evolution/`](draconic_evolution/) — Draconic Evolution Energy Core monitoring.
+- [`turtle/`](turtle/) — Turtle mining programs.
 
 General data flow for both:
 

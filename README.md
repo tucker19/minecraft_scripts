@@ -9,6 +9,7 @@ Scripts I use on my Minecraft servers (currently All the Mods 10).
 | [`cctweaked/`](cctweaked/) | Lua programs for CC: Tweaked computers |
 | [`cctweaked/powah/`](cctweaked/powah/) | Powah reactor monitoring: wired bank monitor, wireless sender, dashboard, pocket viewer |
 | [`cctweaked/draconic_evolution/`](cctweaked/draconic_evolution/) | Draconic Evolution Energy Core monitoring: sender, dashboard, remote dashboard, pocket viewer |
+| [`cctweaked/turtle/`](cctweaked/turtle/) | Turtle programs: chunk-sized quarry down to bedrock |
 
 ## Installing on an in-game computer
 
