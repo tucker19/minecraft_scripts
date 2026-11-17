@@ -1,6 +1,6 @@
 # Turtle quarry and wireless dashboard
 
-`chunk_dig.lua` digs a square, measured in chunks, from the layer below the turtle down to bedrock. By default one stationary barrel behind the starting position receives mined cargo and supplies coal blocks. When cargo needs unloading or fuel runs low, the turtle goes home along a route through blocks it has already cleared. After servicing, it returns to the exact cell and heading it left and carries on.
+`chunk_dig.lua` digs a square, measured in chunks, from the layer below the turtle down to bedrock. By default one stationary inventory behind the starting position receives mined cargo and supplies coal blocks. When cargo needs unloading or fuel runs low, the turtle goes home along a route through blocks it has already cleared. After servicing, it returns to the exact cell and heading it left and carries on.
 
 `turtle_wireless_dash.lua` shows every quarry turtle broadcasting on `turtle_quarry_v1`. You don't configure a turtle ID.
 
@@ -17,25 +17,27 @@ local OUTPUT_SIDE = "back"
 local FUEL_SIDE   = "back"
 ```
 
-### Shared barrel wired dock
+### Shared storage and wired fuel dock
 
-1. Put a vanilla barrel immediately behind the turtle at home and stock it with `minecraft:coal_block`. Leave room for mined blocks.
-2. Put a **Wired Modem (Full Block)** directly above home, and another directly above the barrel. They share a face and connect directly. Keep this wired network dedicated: the only wired vanilla barrel must be the one physically behind home. Do not use an item pipe, hopper, sorting program, or other automated access on either inventory during service.
+1. Put the storage immediately behind the turtle at home and stock it with `minecraft:coal_block`. For unloading, CC:Tweaked must detect its generic `inventory` type on the turtle-facing side, and that side must accept the cargo. The script deposits directly; no wired modem, remote name, `pullItems`, or `getItemDetail` is required for output.
+2. For automatic fuel only, put a **Wired Modem (Full Block)** directly above home and another directly above the shared storage. They share a face and connect directly. Use a dedicated network: the only inventory on it other than the turtle must be the one physically behind home. Do not place unrelated inventories beside either modem.
 3. Put a stationary non-inventory CC peripheral (for example, a CC computer) directly above the home modem as a keepalive. It needs no program. Activate peripheral mode on both full-block modems by right-clicking them with the turtle home. The home modem can switch off if all its local peripherals disappear, so leave the keepalive in place while the turtle is away ([CC:Tweaked full-block modem implementation](https://raw.githubusercontent.com/cc-tweaked/CC-Tweaked/mc-1.21.x/projects/common/src/main/java/dan200/computercraft/shared/peripheral/modem/wired/WiredModemFullBlockEntity.java)).
 
-With the turtle at home, the following optional Lua REPL diagnostic should print its `turtle_N` wired name and a remote list containing exactly one `minecraft:barrel_N` ([CC:Tweaked modem API](https://tweaked.cc/peripheral/modem.html)):
+With the turtle at home in its original facing, this optional Lua REPL diagnostic checks the direct `inventory` type and shows what each wired endpoint exposes ([peripheral API](https://tweaked.cc/mc-1.21.x/module/peripheral.html), [modem API](https://tweaked.cc/peripheral/modem.html)):
 
 ```lua
-local m=peripheral.wrap("top"); print(m.getNameLocal()); textutils.pagedPrint(textutils.serialize(m.getNamesRemote()))
+print(peripheral.hasType("back","inventory")); local m=peripheral.wrap("top"); if m and m.getNameLocal then print(m.getNameLocal()); for _,n in pairs(m.getNamesRemote()) do print(n,textutils.serialize(m.getMethodsRemote(n))) end end
 ```
 
-The dock obtains the turtle's wired name from `getNameLocal()`. The barrel uses `pushItems(turtleName, barrelSlot, 1, turtleSlot)` for fuel and `pullItems(turtleName, turtleSlot, count)` for output. These are [CC:Tweaked inventory methods](https://tweaked.cc/mc-1.21.x/generic_peripheral/inventory.html); the [CC:Tweaked maintainer's wired turtle example](https://github.com/cc-tweaked/CC-Tweaked/discussions/601) shows how to address a turtle in `pushItems`, and the [Forge/NeoForge inventory implementation](https://raw.githubusercontent.com/cc-tweaked/CC-Tweaked/mc-1.21.x/projects/forge/src/main/java/dan200/computercraft/shared/platform/ForgeItemContainer.java) supports restricting the destination to one slot. No wireless-to-inventory adapter or additional program is needed. A wireless or Ender modem upgrade is separate and optional for telemetry/GPS.
+For fuel, the wired storage must expose `list` and slot-specific `pushItems`, and `pushItems(turtleName, sourceSlot, 1, turtleSlot)` must reach a writable turtle slot. The script obtains the target from `getNameLocal()` and verifies what actually arrived; the network name alone does not prove transfers work. This uses the [CC:Tweaked inventory API](https://tweaked.cc/mc-1.21.x/generic_peripheral/inventory.html) and follows the [maintainer's wired turtle example](https://github.com/cc-tweaked/CC-Tweaked/discussions/601). `getItemDetail` is an optional extra check.
 
-The script checks the source item before transferring, but CC:Tweaked does not offer an atomic “transfer only if this slot still contains coal” call ([inventory API](https://tweaked.cc/mc-1.21.x/generic_peripheral/inventory.html)). Refill coal or remove output while the turtle is away or stopped; stop it first if it is home and you need to rearrange the barrel. If a concurrent change delivers a different item, the script stops with `recovery_required` and names the turtle slot. Stop other access, check and remove that unexpected item from the specified slot, then run `chunk_dig resume`. Don't move or turn the turtle to clear this condition.
+With compacting or sorting storage, a GUI count or listed stack is not proof that a coal block can be extracted. The script refreshes the slot list, tries only reported `minecraft:coal_block` slots, and waits if none delivers a block. If necessary, put actual coal blocks in slots exposed to automation, adjust the storage's extraction or upgrade settings, or supply coal blocks directly to the stopped turtle and resume.
+
+The [inventory API](https://tweaked.cc/mc-1.21.x/generic_peripheral/inventory.html) cannot atomically check the item type and transfer it. Do not remove or replace the storage, rearrange its slots, or let other automation modify either inventory while the turtle is servicing. Disable any voiding behavior on the cargo destination. If a concurrent change delivers a different item, the script stops with `recovery_required` and names the slot. Stop other access, check and remove that unexpected item, then run `chunk_dig resume` without moving or turning the turtle.
 
 ### Other placements and separate inventories
 
-Allowed sides are `front`, `back`, `left`, `right` and `top`; `bottom` is reserved for the quarry shaft. For a shared barrel on another horizontal side, keep the full-block dock modem directly above home and connect the adjacent barrel to it. If both sides are `top`, the dock modem goes in front of home instead. Different sides still use the legacy separate-inventory mode; its fuel inventory should contain only coal blocks. Changing the constants affects new jobs only.
+Allowed sides are `front`, `back`, `left`, `right` and `top`; `bottom` is reserved for the quarry shaft. For shared storage on another horizontal side, keep the full-block dock modem directly above home and connect the adjacent inventory to it. If both sides are `top`, the dock modem goes in front of home instead. Different sides still use the legacy separate-inventory mode; its fuel inventory should contain only coal blocks. Changing the constants affects new jobs only.
 
 The quarry does not dig at the home level except to clear a gravity block that falls into the home cell itself. Storage blocks are never dug or replaced.
 
@@ -56,7 +58,7 @@ wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked
 chunk_dig 1 "Mining Quarry 01"
 ```
 
-Use the default sides for the shared barrel behind home. Start only while the turtle is at its base, facing the intended quarry. The first argument is the side length in chunks: `1` = 16×16, `2` = 32×32, `3` = 48×48 blocks. The optional second argument sets the job name; without it the turtle label is used. A new job refuses to replace existing state, even if the job is complete. Align the turtle to chunk boundaries yourself if needed, and note the home block's world coordinates and compass facing so you can verify a pending turn later even without GPS.
+Use the default sides for shared storage behind home. Start only while the turtle is at its base, facing the intended quarry. The first argument is the side length in chunks: `1` = 16×16, `2` = 32×32, `3` = 48×48 blocks. The optional second argument sets the job name; without it the turtle label is used. A new job refuses to replace existing state, even if the job is complete. Align the turtle to chunk boundaries yourself if needed, and note the home block's world coordinates and compass facing so you can verify a pending turn later even without GPS.
 
 Optional GPS-anchored start, if the turtle is actually facing east:
 
@@ -102,7 +104,7 @@ shell.execute("/chunk_dig", "auto")
 - Slot 1 stays selected while mining and idle. Inventory work temporarily selects other slots for unloading, compacting partial stacks, and burning carried fuel. Slot 1 is selected again afterwards, including after errors.
 - All 16 slots hold cargo. No slot is reserved, and no portable chest is used.
 - Before every dig the turtle makes sure it has an empty slot. If none is free, it first merges partial stacks of the same item. If every slot is still occupied, it goes home with the status detail `no empty cargo slot`.
-- Shared-barrel refuelling prefers slot 1, but can use another empty slot (including one freed by compacting cargo or burning a carried coal-block stack). The slot is temporary, not reserved. The turtle checks and burns a transferred coal block explicitly with `turtle.refuel(1)` before unloading again. It never calls `turtle.suck` on the shared barrel.
+- Shared-inventory refuelling prefers slot 1, but can use another empty slot (including one freed by compacting cargo or burning a carried coal-block stack). The slot is temporary, not reserved. The turtle checks and burns a transferred coal block explicitly with `turtle.refuel(1)` before unloading again. It never calls `turtle.suck` on shared storage.
 - Fuel already in the inventory (for example mined coal) can be burned before making a trip just for fuel. The turtle selects that slot, burns one item at a time only until the fuel need is met, and reselects slot 1. Any remaining coal is not hoarded and is unloaded with the rest of the cargo.
 - Anything you put in the turtle before starting is unloaded into the output barrel at startup. The exception is fuel burned to reach the starting fuel requirement.
 
@@ -130,8 +132,8 @@ The turtle keeps broadcasting telemetry while waiting.
 
 | Status | Meaning | What happens |
 | --- | --- | --- |
-| `waiting_output` | Barrel full, dock unavailable, no buffer slot, or a transfer failed. The detail says which. | Stays home with remaining cargo. Remove output or fix the dock; it retries every `RETRY_SECONDS`. A partially consumed coal stack does not free a barrel slot. |
-| `waiting_fuel` | Not enough fuel for departure and no coal blocks were received or burned. | Stays home. Restore the dock or add `minecraft:coal_block`; it retries automatically. |
+| `waiting_output` | Adjacent storage is unverified, full, or rejecting cargo. The detail also says why fuel could not free space. | Stays home with remaining cargo. Make room or fix insertion access; the turtle retries every `RETRY_SECONDS`. |
+| `waiting_fuel` | Not enough fuel for departure, and the wired fuel path could not deliver an extractable coal block. | Stays home. Fix the named missing capability, expose actual `minecraft:coal_block`, or supply coal blocks directly to the stopped turtle. |
 | `blocked` | A cleared route cell is occupied by something it may not dig, or a mob or entity won't move. | Retries every `RETRY_SECONDS`. |
 | `error` | Separate-mode base inventories missing at start, round trip too large for the fuel limit, or another execution error. | Does not continue mining. Fix the reported issue before resuming. |
 | `stopped` | Terminated with Ctrl+T outside an uncertain motion. | Stops in place and retains the job. |
@@ -226,7 +228,7 @@ chunk_dig status
 chunk_dig resume
 ```
 
-The migration checks the dock and writes a new checkpoint without moving the turtle, changing its heading, or starting over. It accepts only an active saved `back/top` job at home and requires GPS verification if the job has a GPS anchor. If interrupted, check `status`: `fuel=top` means the change was not committed; `fuel=back` means it was and you can resume. If a pending action prevents migration, use the manual recovery procedure and let the job stop safely at base again. A different saved side configuration can continue using its original setup; this command does not rewrite it.
+The migration checks the adjacent output capability and writes a new checkpoint without moving the turtle, changing its heading, or starting over. It accepts only an active saved `back/top` job at home and requires GPS verification if the job has a GPS anchor. If interrupted, check `status`: `fuel=top` means the change was not committed; `fuel=back` means it was and you can resume. If a pending action prevents migration, use the manual recovery procedure and let the job stop safely at base again. An already shared `back/back` job only needs the updated script and `chunk_dig resume`; its old peripheral name is no longer used for routing.
 
 ### Pre-persistence job (no checkpoint)
 
@@ -243,6 +245,6 @@ pip install lupa
 python3 cctweaked/turtle/test_quarry.py
 ```
 
-The harness checks the existing quarry behavior and abandons the running Lua coroutine at chosen points before and after moves, turns, digs, transfers, checkpoint publication and phase changes. Shared-inventory tests model sparse mixed slots, full barrels, selective transfers, dock failures, a changed source slot, and interrupted configuration migration. These are mocked process restarts, **not** actual Minecraft chunk unload/reload or block-placement tests.
+The harness checks the existing quarry behavior and abandons the Lua coroutine around moves, turns, digs, transfers, checkpoint publication and phase changes. Shared-inventory tests model output without a fuel dock, sparse mixed slots, full inventories, sorting and virtual coal, missing optional methods, rejected turtle targets, a changed source slot, and interrupted migration. These are simulated, not actual modded storage, block placement, or chunk unload/reload tests.
 
-For an in-game smoke test, use a sacrificial one-chunk job. Start with low fuel, non-fuel items before the coal in the barrel, and some cargo in the turtle. Check that the cargo is deposited, only coal blocks are withdrawn, and the dock reconnects on a return trip. Empty mined output as needed; a single 27-slot barrel can fill well before a quarry finishes. Travel far enough to unload the turtle naturally, return, and check `chunk_dig status` or the dashboard.
+For an in-game smoke test, use a sacrificial one-chunk job. Start with low fuel, non-fuel items before the coal in the shared inventory, and some cargo in the turtle. Check that the cargo is deposited, only coal blocks are withdrawn, and the dock reconnects on a return trip. Empty mined output as needed. Travel far enough to unload the turtle naturally, return, and check `chunk_dig status` or the dashboard.

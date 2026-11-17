@@ -317,9 +317,6 @@ local function verifyLayer(c, depth)
     return true
 end
 local validTask
-local function barrelName(n)
-    return type(n)=="string" and n:match("^minecraft:barrel_%d+$")~=nil
-end
 local function validateState(r)
     local s = r.job
     if not integer(r.seq,1,2^52) or type(s) ~= "table"
@@ -327,8 +324,9 @@ local function validateState(r)
         or not integer(s.created,1,2^52)
         or type(s.name) ~= "string" or #s.name > 200
         or not sides[s.output] or not sides[s.fuel]
-        or (s.barrel~=nil and (s.output~=s.fuel or not barrelName(s.barrel)))
-        or (s.sharedMigration~=nil and (s.output~="back" or s.fuel~="back" or not s.barrel
+        -- Retain the old dock name as opaque checkpoint metadata, not as routing.
+        or (s.barrel~=nil and (s.output~=s.fuel or type(s.barrel)~="string"))
+        or (s.sharedMigration~=nil and (s.output~="back" or s.fuel~="back"
             or not integer(s.sharedMigration,1,r.seq-1)))
         or not integer(s.margin,0,1000000) or not integer(s.progress,1,1000000)
         or not integer(s.retry,1,3600) or not integer(s.layer,0,30000000)
@@ -354,7 +352,7 @@ local function validateState(r)
     end
     for i,t in ipairs(s.tasks) do
         if not validTask(t,i) then recovery("Invalid checkpoint task at depth " .. i) end
-        if t.sharedFuelSlot and (s.output~=s.fuel or not s.barrel) then recovery("Invalid shared fuel buffer") end
+        if t.sharedFuelSlot and s.output~=s.fuel then recovery("Invalid shared fuel buffer") end
     end
     local t=s.tasks[#s.tasks]
     if t then
@@ -642,37 +640,37 @@ local function wireCall(fn,...)
     if value=="Terminated" then fail(value) end
     return nil,tostring(value)
 end
-local function sharedDock(which,expected)
-    if peripheral.getType(localSide(which))~="minecraft:barrel" then
-        return nil,"no vanilla shared barrel on the " .. which .. " side of home"
-    end
+local function sharedOutputAt(which)
+    -- A solid block or an arbitrary peripheral is not enough: turtle.drop
+    -- can eject items into the world when there is no adjacent item handler.
+    return peripheral.hasType(localSide(which),"inventory")
+end
+local function fuelDock(which)
     local dockSide=localSide(which=="top" and "front" or "top")
     local m=peripheral.wrap(dockSide)
     if not m or type(m.isWireless)~="function" or m.isWireless()
         or type(m.getNameLocal)~="function" or type(m.getNamesRemote)~="function"
         or type(m.getMethodsRemote)~="function" or type(m.callRemote)~="function" then
-        return nil,"missing full-block wired dock modem (" .. dockSide .. ")"
+        return nil,"selective fuel requires a wired dock modem (" .. dockSide .. ") with remote inventory calls"
     end
     local id=wireCall(m.getNameLocal)
-    if type(id)~="string" or not id:match("^turtle_%d+$") then
-        return nil,"wired dock has not attached this turtle; enable peripheral mode and check keepalive"
+    if type(id)~="string" or id=="" then
+        return nil,"wired dock does not address this turtle (getNameLocal unavailable); enable peripheral mode and check keepalive"
     end
     local names=wireCall(m.getNamesRemote)
-    local name
+    local name,methods
     for _,n in pairs(names or {}) do
-        if barrelName(n) then
-            if name then return nil,"more than one barrel on the wired dock; use a dedicated network" end
-            name=n
+        if n~=id then
+            local available={}
+            for _,method in pairs(wireCall(m.getMethodsRemote,n) or {}) do available[method]=true end
+            if available.list and available.pushItems then
+                if name then return nil,"multiple wired inventories expose list/pushItems; use a dedicated network for the shared storage" end
+                name,methods=n,available
+            end
         end
     end
-    if not name then return nil,"shared barrel not attached to the wired dock" end
-    if expected and name~=expected then return nil,"wired shared barrel changed; expected " .. expected end
-    local methods={}
-    for _,method in pairs(wireCall(m.getMethodsRemote,name) or {}) do methods[method]=true end
-    if not (methods.list and methods.getItemDetail and methods.pushItems and methods.pullItems) then
-        return nil,"wired shared barrel lacks CC:Tweaked inventory methods"
-    end
-    return {name=name,id=id,call=function(method,...)
+    if not name then return nil,"selective fuel requires list and slot-specific pushItems on the wired shared inventory" end
+    return {id=id,detail=methods.getItemDetail,call=function(method,...)
         return wireCall(m.callRemote,name,method,...)
     end}
 end
@@ -704,32 +702,65 @@ local function burnCarriedForBuffer()
     end
 end
 
-local function sharedPull(t,dock)
-    if not roomForFuel(t) or fuel()==math.huge then return false,"fuel tank has no room for a coal block" end
-    local items,why=dock.call("list")
-    if type(items)~="table" then return false,"cannot list shared barrel: " .. tostring(why) end
-    local from,best
+local function coalSlot(items,tried)
+    local from,best,count=nil,nil,0
     for i,d in pairs(items) do
-        if d.name==COAL_BLOCK and (not best or d.count<best or (d.count==best and i<from)) then
-            from,best=i,d.count
+        if integer(i,1,2^31-1) and type(d)=="table" and d.name==COAL_BLOCK
+            and type(d.count)=="number" and d.count>0 and not tried[i] then
+            count=count+1
+            if not best or d.count<best or (d.count==best and i<from) then from,best=i,d.count end
         end
     end
-    if not from then return false,"no coal blocks in shared barrel" end
+    return from,count
+end
+local function sharedPull(t)
+    if not roomForFuel(t) or fuel()==math.huge then return false,"fuel tank has no room for a coal block" end
+    local dock,missing=fuelDock(S.output)
+    if not dock then return false,missing end
+    local items,why=dock.call("list")
+    if type(items)~="table" then return false,"cannot list wired shared inventory: " .. tostring(why) end
+    local tried={}
+    local _,attempts=coalSlot(items,tried)
+    if attempts==0 then return false,"no coal blocks exposed by the wired inventory" end
     local into=bufferSlot() or burnCarriedForBuffer()
     if not into then return false,"all 16 turtle slots occupied; no slot for a coal block" end
     -- Persist the empty buffer slot before the transfer. A reboot can
     -- consume a delivered coal block or detect a changed source slot.
     t.sharedFuelSlot=into
     checkpoint()
-    local d,err=dock.call("getItemDetail",from)
-    if not d or d.name~=COAL_BLOCK then return false,"coal slot changed before transfer" .. (err and (": " .. err) or "") end
-    local moved,problem=dock.call("pushItems",dock.id,from,1,into)
-    local got=turtle.getItemDetail(into)
-    if got and (got.name~=COAL_BLOCK or got.count~=1) then
-        recovery("Unexpected item in shared fuel buffer slot " .. into .. "; stop other access to the barrel and remove that item before resuming")
+    local problem="coal slots changed before transfer"
+    -- Refresh after the checkpoint and every failed attempt. Do not chase
+    -- moving virtual slots indefinitely or retry the same index in a pass.
+    for _=1,attempts do
+        items,why=dock.call("list")
+        if type(items)~="table" then return false,"cannot refresh wired shared inventory: " .. tostring(why) end
+        local from=coalSlot(items,tried)
+        if not from then break end
+        tried[from]=true
+        local d=items[from]
+        if dock.detail then
+            local detail,err=dock.call("getItemDetail",from)
+            -- An optional method that errors is not needed for a fresh list.
+            if not err then d=detail end
+        end
+        if d and d.name==COAL_BLOCK then
+            local moved,err=dock.call("pushItems",dock.id,from,1,into)
+            local got=turtle.getItemDetail(into)
+            if got and (got.name~=COAL_BLOCK or got.count~=1) then
+                recovery("Unexpected item in shared fuel buffer slot " .. into .. "; stop other access to the inventory and remove that item before resuming")
+            end
+            if got then return true end
+            if err then
+                return false,"wired slot transfer to the turtle failed; verify the turtle exposes a writable inventory: " .. err
+            end
+            if moved~=0 then
+                recovery("Wired transfer returned " .. tostring(moved) .. " but the fuel buffer did not receive it; inspect both inventories before resuming")
+            end
+            problem="coal was listed but no block was extracted into turtle slot " .. into
+                .. "; check storage extraction/compaction or the wired turtle target"
+        end
     end
-    if got then return true end
-    return false,"wired coal transfer did not reach slot " .. into .. ": " .. tostring(problem or moved)
+    return false,problem
 end
 
 local function sharedBase(t)
@@ -738,7 +769,7 @@ local function sharedBase(t)
         if d then
             if d.name~=COAL_BLOCK or d.count~=1 then
                 recovery("Unexpected item in shared fuel buffer slot " .. t.sharedFuelSlot
-                    .. "; stop other access to the barrel and remove that item before resuming")
+                    .. "; stop other access to the inventory and remove that item before resuming")
             end
             if fuel()<limit() and fuel()~=math.huge then
                 if not burn(t.sharedFuelSlot) then
@@ -764,13 +795,10 @@ local function sharedBase(t)
         carriedBlocks(t.need)
         carried(t.need)
     end
-    local dock,why=sharedDock(S.output,S.barrel)
-    if not dock then
-        local waiting=(t.stage=="refuel" or t.stage=="waiting_fuel") and "waiting_fuel" or "waiting_output"
-        waitFor(waiting,why)
+    if not sharedOutputAt(S.output) then
+        waitFor("waiting_output","no adjacent item inventory capability on the " .. S.output .. " side of home")
         return
     end
-    if not S.barrel then S.barrel=dock.name; return true end
     if t.stage=="validate_output" or t.stage=="validate_fuel" or t.stage=="invalid_base" then
         t.stage,t.problem="unload",nil
         return true
@@ -780,23 +808,25 @@ local function sharedBase(t)
         local n=turtle.getItemCount(i)
         if n>0 then
             hasCargo=true
-            local moved,err=dock.call("pullItems",dock.id,i,n)
+            if S.output~="top" and not face(sides[S.output]) then return end
+            if not sharedOutputAt(S.output) then
+                baseWait(t,"waiting_output","adjacent inventory capability disappeared; cargo retained")
+                return
+            end
+            local _,err=drop(S.output,i)
             if turtle.getItemCount(i)<n then return end
-            if not moved then transferError=err or "wired output transfer unavailable" end
+            transferError=err or "no cargo accepted"
         end
     end
     if hasCargo then
-        if not transferError then
-            local ok,err=sharedPull(t,dock)
-            if ok then return end
-            transferError="shared barrel has no room for cargo; " .. err
-        end
-        baseWait(t,"waiting_output",transferError)
+        local ok,err=sharedPull(t)
+        if ok then return end
+        baseWait(t,"waiting_output",transferError .. "; " .. err)
         return
     end
     if t.final or fuel()==math.huge or not roomForFuel(t) then t.stage="orient"; return true end
     if t.stage~="refuel" and t.stage~="waiting_fuel" then t.stage="refuel"; return true end
-    local ok,err=sharedPull(t,dock)
+    local ok,err=sharedPull(t)
     if ok then return end
     if fuel()>=t.need then t.stage="orient"; return true end
     baseWait(t,"waiting_fuel",err)
@@ -1352,8 +1382,7 @@ local function run()
                 local names={}; for _,t in ipairs(S.tasks) do names[#names+1]=t.kind .. "/" .. (t.stage or "-") end
                 return names
             end)()," > "),describe(S.home),describe(S.pos)))
-        print("Base: output=" .. S.output .. ", fuel=" .. S.fuel
-            .. (S.barrel and (", wired barrel=" .. S.barrel) or ""))
+        print("Base: output=" .. S.output .. ", fuel=" .. S.fuel)
         local j=actionRecord()
         if j and j.seq==generation then
             print(("Pending %s #%d\nBefore: %s\nAfter: %s"):format(j.op,j.seq,describe(j.before),describe(j.after)))
@@ -1372,11 +1401,10 @@ local function run()
         if j and j.seq==generation then recovery("Resolve the pending action before migrating; run chunk_dig status") end
         reconcile() -- drain queued commands and verify GPS if configured; no motion
         verifiedPose=true
-        local dock,message=sharedDock("back")
-        if not dock then fail("Migration not saved: " .. message) end
-        S.fuel,S.barrel,S.sharedMigration="back",dock.name,generation
+        if not sharedOutputAt("back") then fail("Migration not saved: no adjacent item inventory capability behind home") end
+        S.fuel,S.sharedMigration="back",generation
         checkpoint()
-        print("Saved shared back/back configuration (" .. S.barrel .. "); run chunk_dig resume")
+        print("Saved shared back/back configuration; run chunk_dig resume")
         return
     end
     if mode=="auto" or mode=="resume" or mode=="resolve" then
