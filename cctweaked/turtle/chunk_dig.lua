@@ -68,8 +68,27 @@ end
 
 local function forward()
     for attempt = 1, 50 do
-        safeDig()
-        if turtle.forward() then return true end
+        if safeDig() then
+            if turtle.forward() then return true end
+        elseif turtle.getFuelLevel() > 0 then
+            -- Undiggable block ahead (bedrock-adjacent mods, ATM10's
+            -- Allthemodium ore, obsidian with a weak pick, ...).
+            -- Climb over it and drop in behind it, leaving the block
+            -- in the wall to collect by hand later.
+            if not up() then break end
+
+            if turtle.forward() then
+                if down() then return true end
+
+                error("Climbed over an undiggable block but cannot"
+                    .. " descend behind it.", 0)
+            end
+
+            turtle.down()
+        else
+            break -- out of fuel, digging fails
+        end
+
         turtle.attack()
         sleep(0.1)
     end
