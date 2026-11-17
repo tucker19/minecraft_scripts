@@ -4,7 +4,7 @@ Lua programs for [CC: Tweaked](https://tweaked.cc/) Advanced Computers and Pocke
 
 - [`powah/`](powah/) — Powah reactor (and thermo generator) monitoring.
 - [`draconic_evolution/`](draconic_evolution/) — Draconic Evolution Energy Core monitoring.
-- [`turtle/`](turtle/) — Chunk quarry with external fuel loading and a wireless fleet dashboard.
+- [`turtle/`](turtle/) — Chunk quarry that services itself at a home base (output barrel + coal-block fuel inventory) and resumes, plus a wireless fleet dashboard.
 
 General data flow for both:
 
