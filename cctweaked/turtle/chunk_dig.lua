@@ -1,296 +1,274 @@
--- chunk_dig: dig a chunk-sized square area straight down to bedrock.
---
--- Usage:
---   chunk_dig <chunks>
---
---   1 = 16x16 blocks (one chunk)
---   2 = 32x32 blocks (2x2 chunks)
---   3 = 48x48 blocks (3x3 chunks)
---
--- The turtle digs a square with its starting corner where it sits,
--- clears 3 layers per pass, and stops at bedrock. When finished (or
--- out of fuel) it climbs back up to its starting position.
---
--- Put an ender chest in slot 16 and the turtle drops its inventory
--- into it automatically when it fills up.
-
+-- chunk_dig <chunks> [job name]
+-- Square extends forward and right. Slot 15: portable fuel storage.
+-- Slot 16: portable output chest. Storage directly ABOVE is also a fuel source.
+-- New run only: no reboot/crash resume. Do not auto-start in a partial quarry.
 local args = {...}
 local chunks = tonumber(args[1])
-
-if not chunks or chunks < 1 or chunks % 1 ~= 0 then
-    print("Usage: chunk_dig <chunks>")
-    print("  1 = 16x16, 2 = 2x2 chunks, 3 = 3x3 chunks")
-    print("Digs from the turtle's level down to bedrock,")
-    print("then climbs back to the start.")
+if not turtle then error("Run on a mining turtle", 0) end
+if not chunks or chunks < 1 or chunks % 1 ~= 0 or chunks == math.huge then
+    print('Usage: chunk_dig <chunks> [job name]')
     return
 end
-
-local SIDE = chunks * 16
-
--- heading: 0 = initial facing, 1 = right of it, 2 = behind, 3 = left of it
-local heading = 0
-local depth = 0
-
-local function turnRight()
-    turtle.turnRight()
+local side = chunks * 16
+local protocol = "turtle_quarry_v1"
+local jobName = args[2] or os.getComputerLabel() or ("Quarry " .. os.getComputerID())
+local pos, heading = {x = 0, y = 0, z = 0}, 0
+local status, detail, lastFuel = "starting", "", "none consumed yet"
+local cells, layer, lastSend = 0, 0, -math.huge
+local modem, world, lastGPS = nil, nil, -math.huge
+local fuelChestOut, outputChestOut = false, false
+local function fuelLevel()
+    local n = turtle.getFuelLevel()
+    return n == "unlimited" and math.huge or n
+end
+local function inventory()
+    local used, items, capacity = 0, 0, 0
+    for i = 1, 14 do
+        local count = turtle.getItemCount(i)
+        if count > 0 then used = used + 1 end
+        items = items + count
+        capacity = capacity + count + turtle.getItemSpace(i)
+    end
+    return {usedSlots = used, totalSlots = 14, items = items,
+        capacity = capacity, percent = 100 * used / 14}
+end
+local function telemetry(force)
+    if not force and os.clock() - lastSend < 2 then return end
+    lastSend = os.clock()
+    modem = peripheral.find("modem", function(_, m) return m.isWireless() end)
+    if not modem then return end
+    local name = peripheral.getName(modem)
+    if not rednet.isOpen(name) then rednet.open(name) end
+    if os.clock() - lastGPS >= 15 then
+        lastGPS = os.clock()
+        local x, y, z = gps.locate(0.3, false)
+        world = x and {x = x, y = y, z = z} or nil
+    end
+    -- GPS is a sampled fix, NOT a fabricated absolute position.
+    pcall(rednet.broadcast, {
+        type = "quarry", version = 1, id = os.getComputerID(), name = jobName,
+        status = status, detail = detail, fuelType = lastFuel,
+        fuel = turtle.getFuelLevel(), fuelLimit = turtle.getFuelLimit(),
+        job = {chunks = chunks, side = side, area = side * side,
+            layer = layer, cells = cells},
+        inventory = inventory(),
+        location = {relative = {x = pos.x, y = pos.y, z = pos.z},
+            heading = heading, gps = world, gpsAge = os.clock() - lastGPS},
+    }, protocol)
+end
+local function announce(s, d)
+    status, detail = s, d or ""
+    print(s .. (detail ~= "" and (": " .. detail) or ""))
+    telemetry(true)
+end
+local function storageAbove()
+    local p = peripheral.wrap("top")
+    return p and type(p.list) == "function"
+end
+local function storageItem(slot)
+    local item = turtle.getItemDetail(slot)
+    return item and (item.name:find("chest") or item.name:find("barrel"))
+end
+local function recover(slot)
+    turtle.select(slot)
+    if not turtle.digUp() or turtle.getItemCount(slot) == 0 then
+        error("Cannot recover portable storage above; collect it manually", 0)
+    end
+end
+local function consume(target)
+    for i = 1, 14 do
+        turtle.select(i)
+        while fuelLevel() < target and turtle.refuel(0) do
+            local item = turtle.getItemDetail(i)
+            local before = fuelLevel()
+            if not turtle.refuel(1) then break end
+            if fuelLevel() <= before then break end
+            lastFuel = item.name
+        end
+    end
+    turtle.select(1)
+end
+local function pullFuel(target)
+    local placed = false
+    if not storageAbove() and not turtle.detectUp() and storageItem(15) then
+        turtle.select(15)
+        placed = turtle.placeUp()
+        fuelChestOut = placed
+    end
+    if storageAbove() then
+        -- Fuel-only storage recommended. Return non-fuel/container leftovers
+        -- to the source rather than allowing them to fill the turtle.
+        for _ = 1, 32 do
+            if fuelLevel() >= target then break end
+            local empty
+            for i = 1, 14 do
+                if turtle.getItemCount(i) == 0 then empty = i; break end
+            end
+            if not empty then break end
+            turtle.select(empty)
+            if not turtle.suckUp(64) then break end
+            consume(target)
+            turtle.select(empty)
+            if turtle.getItemCount(empty) > 0 and not turtle.dropUp() then
+                break
+            end
+        end
+    end
+    if placed then recover(15); fuelChestOut = false end
+    turtle.select(1)
+end
+local function ensureFuel()
+    if fuelLevel() > 100 then return end
+    local limit = turtle.getFuelLimit()
+    local target = limit == "unlimited" and 1000 or math.min(4000, limit)
+    consume(target)
+    pullFuel(target)
+    while fuelLevel() <= 100 do
+        announce("waiting_fuel", "Add fuel to inventory or fuel storage above")
+        sleep(3)
+        consume(target)
+        pullFuel(target)
+    end
+    status, detail = "mining", ""
+end
+local function unload()
+    if inventory().usedSlots < 14 then return end
+    local previous = status
+    while inventory().usedSlots >= 14 do
+        local placed = false
+        if not turtle.detectUp() and storageItem(16) then
+            turtle.select(16)
+            placed = turtle.placeUp()
+            outputChestOut = placed
+        end
+        if placed then
+            for i = 1, 14 do
+                turtle.select(i)
+                -- Keep fuel items; only unload mined cargo.
+                if not turtle.refuel(0) then turtle.dropUp() end
+            end
+            recover(16)
+            outputChestOut = false
+        end
+        if inventory().usedSlots >= 14 then
+            announce("waiting_inventory", "Free a cargo slot or empty output chest (slot 16)")
+            sleep(3)
+        end
+    end
+    status, detail = previous, ""
+    turtle.select(1)
+end
+local function right()
+    assert(turtle.turnRight(), "Cannot turn")
     heading = (heading + 1) % 4
 end
-
-local function turnLeft()
-    turtle.turnLeft()
-    heading = (heading + 3) % 4
+local function face(h)
+    while heading ~= h do right() end
 end
-
-local function turnTo(target)
-    while heading ~= target do turnRight() end
-end
-
-local function safeDig()
-    while turtle.detect() do
-        if not turtle.dig() then return false end
-    end
-    return true
-end
-
-local function safeDigUp()
-    while turtle.detectUp() do
-        if not turtle.digUp() then return false end
-    end
-    return true
-end
-
-local function safeDigDown()
-    while turtle.detectDown() do
-        if not turtle.digDown() then return false end
-    end
-    return true
-end
-
-local function forward()
-    for attempt = 1, 50 do
-        if safeDig() then
-            if turtle.forward() then return true end
-        elseif turtle.getFuelLevel() > 0 then
-            -- Undiggable block ahead (bedrock-adjacent mods, ATM10's
-            -- Allthemodium ore, obsidian with a weak pick, ...).
-            -- Climb over it and drop in behind it, leaving the block
-            -- in the wall to collect by hand later.
-            if not up() then break end
-
-            if turtle.forward() then
-                if down() then return true end
-
-                error("Climbed over an undiggable block but cannot"
-                    .. " descend behind it.", 0)
+local dx, dz = {[0] = 1, 0, -1, 0}, {[0] = 0, 1, 0, -1}
+local function step(kind)
+    ensureFuel()
+    local inspect = kind == "up" and turtle.inspectUp
+        or kind == "down" and turtle.inspectDown or turtle.inspect
+    local dig = kind == "up" and turtle.digUp
+        or kind == "down" and turtle.digDown or turtle.dig
+    local move = kind == "up" and turtle.up
+        or kind == "down" and turtle.down or turtle.forward
+    local attack = kind == "up" and turtle.attackUp
+        or kind == "down" and turtle.attackDown or turtle.attack
+    for _ = 1, 30 do
+        local blocked, block = inspect()
+        if blocked then
+            -- Never intentionally mine ATM ores with a fake player.
+            if block.name:match("^allthemodium:.*ore") then
+                return false, block.name
             end
-
-            turtle.down()
-        else
-            break -- out of fuel, digging fails
+            if storageAbove() and kind == "up" then
+                return false, "storage above"
+            end
+            unload()
+            turtle.select(1)
+            if not dig() then return false, block.name end
         end
-
-        turtle.attack()
+        if move() then
+            if kind == "up" then pos.y = pos.y + 1
+            elseif kind == "down" then pos.y = pos.y - 1
+            else pos.x = pos.x + dx[heading]; pos.z = pos.z + dz[heading] end
+            telemetry()
+            return true
+        end
+        attack()
         sleep(0.1)
     end
-    return false
+    return false, "movement blocked"
 end
-
-local function up()
-    safeDigUp()
-    return turtle.up()
+local function mustStep(kind)
+    local ok, reason = step(kind)
+    if not ok then error("Blocked " .. kind .. ": " .. tostring(reason), 0) end
 end
-
-local function down()
-    safeDigDown()
-    return turtle.down()
-end
-
-local function bedrockBelow()
-    local ok, data = turtle.inspectDown()
-    return ok and data.name == "minecraft:bedrock"
-end
-
-local function refuel()
-    for slot = 1, 16 do
-        turtle.select(slot)
-        turtle.refuel()
+local function forward()
+    local ok, reason = step("forward")
+    if not ok then
+        -- Travel ABOVE the obstacle, not down into the same blocked cell.
+        announce("bypassing", tostring(reason))
+        mustStep("up")
+        mustStep("forward")
     end
-end
-
--- One pass: a serpentine sweep over the whole square.
--- At each cell the turtle clears above and below, so each pass
--- removes 3 layers: the one it sits on, one above, one below.
-local function digPass()
-    for row = 1, SIDE do
-        safeDigUp()
-        safeDigDown()
-
-        for col = 1, SIDE - 1 do
-            if not forward() then
-                error("Stuck while digging row " .. row, 0)
-            end
-            safeDigUp()
-            safeDigDown()
-        end
-
-        if row < SIDE then
-            if row % 2 == 1 then
-                turnRight()
-                forward()
-                turnRight()
-            else
-                turnLeft()
-                forward()
-                turnLeft()
-            end
-        end
-    end
-end
-
--- After a pass the turtle sits at a far corner:
---   SIDE odd  -> (SIDE-1, SIDE-1), heading 0
---   SIDE even -> (0, SIDE-1), heading 2
--- Walk back to the starting corner.
-local function returnToStart()
-    if heading == 0 then
-        turnRight()
-        turnRight()
-        for i = 1, SIDE - 1 do forward() end
-        turnRight()
-        for i = 1, SIDE - 1 do forward() end
-    else
-        turnRight()
-        for i = 1, SIDE - 1 do forward() end
-    end
-end
-
-local function usedSlots()
-    local used = 0
-    for slot = 1, 16 do
-        if turtle.getItemCount(slot) > 0 then used = used + 1 end
-    end
-    return used
-end
-
-local function dropoff()
-    local chest = turtle.getItemDetail(16)
-
-    if not chest or not chest.name:lower():find("chest") then
-        return false
-    end
-
-    safeDigUp()
-    turtle.select(16)
-
-    if not turtle.placeUp() then return false end
-
-    for slot = 1, 15 do
-        turtle.select(slot)
-        turtle.dropUp()
-    end
-
-    turtle.select(16)
-    turtle.digUp() -- chest item falls onto the turtle and is collected
-    return true
-end
-
--- Fuel needed: one more pass, the walk home, the descent,
--- and a reserve for the final climb back up.
-local function fuelNeeded()
-    return SIDE * SIDE + 4 * SIDE + 40 + depth + 3
-end
-
-local function fuelCheck()
-    if turtle.getFuelLevel() >= fuelNeeded() then return true end
-
-    refuel()
-
-    if turtle.getFuelLevel() >= fuelNeeded() then return true end
-
-    print("Fuel low: have " .. turtle.getFuelLevel()
-        .. ", need about " .. fuelNeeded())
-    return false
-end
-
--- Descend one layer. Returns "ok", "bedrock", or "stuck".
-local function descendOne()
-    if down() then
-        depth = depth + 1
-        return "ok"
-    end
-
-    if bedrockBelow() then
-        return "bedrock"
-    end
-
-    return "stuck"
-end
-
-print("Digging " .. SIDE .. "x" .. SIDE .. " blocks ("
-    .. chunks .. "x" .. chunks .. " chunks) down to bedrock.")
-print("Tip: ender chest in slot 16 = automatic inventory drop-off.")
-
-local estPasses = math.ceil(130 / 3)
-local estFuel = estPasses * (SIDE * SIDE + 4 * SIDE + 40)
-print("Rough fuel estimate: about " .. estFuel
-    .. " (" .. math.ceil(estFuel / 800) .. " coal blocks).")
-
-if not fuelCheck() then
-    print("Add fuel (coal, etc.) and run again.")
-    return
-end
-
-local pass = 0
-local stopped = false
-
-while not stopped do
-    if not fuelCheck() then
-        print("Out of fuel. Refuel and run chunk_dig "
-            .. chunks .. " again to continue.")
-        stopped = true
-    else
-        turnTo(0)
-        digPass()
-        pass = pass + 1
-        print("Pass " .. pass .. " done. Depth: " .. depth)
-
-        returnToStart()
-
-        if usedSlots() >= 15 then
-            if dropoff() then
-                print("Inventory dropped into the ender chest.")
-            else
-                print("WARNING: inventory nearly full and no chest in")
-                print("slot 16 - new drops will be lost.")
-            end
-        end
-
-        for i = 1, 3 do
-            local result = descendOne()
-
-            if result == "bedrock" then
-                print("Bedrock reached.")
-                stopped = true
-                break
-            elseif result ~= "ok" then
-                print("Cannot dig down - something undiggable is below.")
-                stopped = true
+    while pos.y > -layer do
+        local lowered, block = step("down")
+        if not lowered then
+            if block == "minecraft:bedrock"
+                or tostring(block):match("^allthemodium:.*ore") then
+                -- Remain above this protected cell. The next horizontal
+                -- step attempts to return to the working layer again.
                 break
             end
+            error("Cannot return to working layer: " .. tostring(block), 0)
         end
     end
+    status, detail = "mining", ""
 end
-
-print("Climbing back up " .. depth .. " layers...")
-
-for i = 1, depth do
-    if not up() then
-        print("Blocked while climbing at layer " .. i .. ".")
-        print("Come collect me - I'm " .. (depth - i) .. " layers down.")
-        return
+local function main()
+    announce("starting", side .. "x" .. side .. "; fuel source above / portable slot 15")
+    -- Load from an adjacent chest even if already carrying plenty of fuel.
+    consume(4000)
+    pullFuel(4000)
+    while true do
+        announce("mining", "Layer " .. layer)
+        for row = 1, side do
+            for col = 1, side do
+                cells = cells + 1
+                unload()
+                telemetry()
+                if col < side then forward() end
+            end
+            if row < side then
+                face(1); forward()
+                face(row % 2 == 1 and 2 or 0)
+            end
+        end
+        -- SIDE is always even: finish at x=0, z=SIDE-1, facing backwards.
+        face(3)
+        for _ = 1, side - 1 do forward() end
+        face(0)
+        if pos.y ~= -layer then error("Origin column blocked at working layer", 0) end
+        local ok, reason = step("down")
+        if not ok then
+            if reason ~= "minecraft:bedrock" then
+                error("Descent blocked: " .. tostring(reason), 0)
+            end
+            announce("returning", "First bedrock at origin column; returning home")
+            while pos.y < 0 do mustStep("up") end
+            announce("complete", "Returned to starting corner")
+            return
+        end
+        layer = layer + 1
     end
 end
-
-turnTo(0)
-print("Done. " .. pass .. " passes, depth " .. depth
-    .. ". Back at the starting corner.")
+local ok, err = pcall(main)
+if not ok then
+    -- Do not move blindly or dig a deployed chest after an error/termination.
+    announce("stopped", tostring(err) .. ((fuelChestOut or outputChestOut)
+        and " (check portable storage above)" or ""))
+end
+while true do telemetry(true); sleep(3) end
