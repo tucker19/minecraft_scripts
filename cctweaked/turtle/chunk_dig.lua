@@ -1,4 +1,5 @@
 -- chunk_dig <chunks> [job name] [north|east|south|west]
+-- chunk_dig archive | new <chunks> [job name] [north|east|south|west]
 -- chunk_dig resume | auto | status | resolve <generation> <before|after>
 -- chunk_dig migrate-shared  (existing back/top job, safely stopped at home)
 -- Stand at the original base to start. The first mined layer is below home.
@@ -396,6 +397,30 @@ local function readState()
     end
     if not latest and fs.exists(DIR) then recovery("No committed checkpoint in " .. DIR) end
     return latest
+end
+
+local function archiveState()
+    if not fs.exists(DIR) then return false end
+    if not fs.isDir(DIR) then fail("Cannot archive " .. DIR .. ": not a directory") end
+    local prefix=DIR:sub(2) .. "-archive-"
+    local highest="0"
+    for _,name in ipairs(fs.list("/")) do
+        local n=name:sub(1,#prefix)==prefix and name:sub(#prefix+1)
+        if n and n:match("^%d+$") then
+            n=n:gsub("^0+","")
+            if #n>#highest or (#n==#highest and n>highest) then highest=n end
+        end
+    end
+    -- Increment the decimal suffix without rounding large numbers.
+    local head,nines=highest:match("^(.-)(9*)$")
+    local nextSuffix=(head=="" and "1" or head:sub(1,-2) .. (tonumber(head:sub(-1))+1))
+        .. ("0"):rep(#nines)
+    local dest="/" .. prefix .. (#nextSuffix==1 and "0" or "") .. nextSuffix
+    if fs.exists(dest) then fail("Cannot archive " .. DIR .. ": " .. dest .. " already exists") end
+    local ok,why=pcall(fs.move,DIR,dest)
+    if not ok then fail("Cannot archive " .. DIR .. ": " .. tostring(why)) end
+    print("Archived quarry job to " .. dest)
+    return true
 end
 
 local function task() return S.tasks[#S.tasks] end
@@ -1424,16 +1449,30 @@ local function run()
     local mode=args[1]
     if not mode then
         print("Usage: chunk_dig <chunks> [job name] [north|east|south|west]")
+        print("       chunk_dig new <chunks> [job name] [north|east|south|west]")
+        print("       chunk_dig archive")
         print("       chunk_dig resume | status | resolve <generation> <before|after> | migrate-shared")
         return
     end
-    local loaded,r=pcall(readState)
-    if not loaded then
-        r=tostring(r)
-        if r:sub(1,10)=="RECOVERY: " then fail(r) end
-        recovery("Cannot validate saved state: " .. r)
+    if mode=="archive" then
+        if #args~=1 then fail("Usage: chunk_dig archive") end
+        if not archiveState() then print("No saved quarry job to archive.") end
+        return
     end
-    if r then S,generation,side=r.job,r.seq,r.job.chunks*16 end
+    local replacing=mode=="new"
+    if replacing then
+        if #args<2 or #args>4 then
+            fail("Usage: chunk_dig new <chunks> [job name] [north|east|south|west]")
+        end
+    else
+        local loaded,r=pcall(readState)
+        if not loaded then
+            r=tostring(r)
+            if r:sub(1,10)=="RECOVERY: " then fail(r) end
+            recovery("Cannot validate saved state: " .. r)
+        end
+        if r then S,generation,side=r.job,r.seq,r.job.chunks*16 end
+    end
     if mode=="status" then
         if not S then print("No saved quarry job"); return end
         if not S.done then turtle.inspectDown() end
@@ -1491,18 +1530,25 @@ local function run()
         verifiedPose=true
         announce("resumed","Continuing saved " .. task().kind .. " step")
     else
-        local chunks=tonumber(mode)
-        if not integer(chunks,1,64) or (args[3] and cardinal[args[3]]==nil) then fail("Invalid quarry size or cardinal facing; run chunk_dig for usage") end
+        local first=replacing and 2 or 1
+        local chunks,name,facing=tonumber(args[first]),args[first+1],args[first+2]
+        if not integer(chunks,1,64) or (facing and cardinal[facing]==nil) then fail("Invalid quarry size or cardinal facing; run chunk_dig for usage") end
         if S then fail("A saved quarry exists; use resume, or archive " .. DIR .. " before starting a new job") end
         if not sides[OUTPUT_SIDE] or not sides[FUEL_SIDE] then fail("Invalid output or fuel side") end
         local anchor
-        if args[3] then
+        if facing then
             anchor=locate(2)
             if not anchor then fail("GPS home fix unavailable; no job created") end
-            anchor.h=cardinal[args[3]]
+            anchor.h=cardinal[facing]
         end
-        local name=args[2] or os.getComputerLabel() or ("Quarry " .. os.getComputerID())
+        name=name or os.getComputerLabel() or ("Quarry " .. os.getComputerID())
         if #name>200 then fail("Job name is too long") end
+        if replacing then
+            local need,capacity=2*MIN_PROGRESS+SAFETY_MARGIN,limit()
+            if need>capacity then fail("round trip needs " .. need .. " fuel but the fuel limit is " .. capacity) end
+            -- Base checks that require turning remain in the journaled startup.
+            archiveState()
+        end
         turtle.select(1)
         S={owner=os.getComputerID(),created=os.epoch("utc"),chunks=chunks,name=name,output=OUTPUT_SIDE,fuel=FUEL_SIDE,
             margin=SAFETY_MARGIN,progress=MIN_PROGRESS,retry=RETRY_SECONDS,anchor=anchor,
@@ -1526,10 +1572,14 @@ end
 
 local ok,why=pcall(run)
 if not ok then
-    turtle.select(1)
     why=tostring(why)
-    if pending then verifiedPose=false end
-    local needRecovery=why:sub(1,10)=="RECOVERY: " or pending~=nil
-    local state=needRecovery and "recovery_required" or (why=="Terminated" and "stopped" or "error")
-    announce(state,why)
+    if args[1]=="archive" or (args[1]=="new" and not S) then
+        print("error: " .. why)
+    else
+        turtle.select(1)
+        if pending then verifiedPose=false end
+        local needRecovery=why:sub(1,10)=="RECOVERY: " or pending~=nil
+        local state=needRecovery and "recovery_required" or (why=="Terminated" and "stopped" or "error")
+        announce(state,why)
+    end
 end

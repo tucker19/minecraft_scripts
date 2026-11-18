@@ -52,7 +52,7 @@ local inTrip = false
 local nestedTrips = 0
 local gpsMovedSeen = false
 local cuts, cutIndex, files, printed = O.cuts or {}, 1, {}, {}
-local directories = {}
+local directories = {["/"]=true}
 local saveDir = "/.chunk_dig"
 local queuedMove, move
 local function fault(name)
@@ -83,12 +83,43 @@ textutils = {
 }
 fs = {
     exists=function(path) return files[path] ~= nil or directories[path] ~= nil end,
-    makeDir=function(path) directories[path]=true end,
+    isDir=function(path) return directories[path] ~= nil end,
+    list=function(path)
+        assert(directories[path])
+        local names,prefix={},path=="/" and "/" or path .. "/"
+        for _,entries in ipairs({files,directories}) do
+            for p in pairs(entries) do
+                local name=p:sub(#prefix+1)
+                if p:sub(1,#prefix)==prefix and name:match("^[^/]+$") then
+                    names[#names+1]=name
+                end
+            end
+        end
+        return names
+    end,
+    makeDir=function(path)
+        if path==saveDir and O.failFreshDirectory then error("injected fresh directory failure",0) end
+        directories[path]=true
+    end,
     delete=function(path)
         if path == saveDir .. "/action" then fault("before_action_clear") end
         files[path]=nil
     end,
     move=function(a,b)
+        assert(not fs.exists(b))
+        if directories[a] then
+            if O.failArchiveMove then error("injected archive move failure",0) end
+            for _,entries in ipairs({files,directories}) do
+                local moving={}
+                for path,value in pairs(entries) do
+                    if path==a or path:sub(1,#a+1)==a .. "/" then moving[path]=value end
+                end
+                for path,value in pairs(moving) do
+                    entries[b .. path:sub(#a+1)],entries[path]=value,nil
+                end
+            end
+            return
+        end
         local action=b==saveDir .. "/action"
         fault(action and "before_action_publish" or "before_state_publish")
         assert(files[a] and not files[b])
@@ -96,6 +127,7 @@ fs = {
         fault(action and "after_action_publish" or "after_state_publish")
     end,
     open=function(path,mode)
+        if O.rejectFileOpen then error("unexpected file open",0) end
         if mode=="r" then
             if not files[path] then return nil,"missing" end
             return {readAll=function() return files[path] end,close=function() end}
@@ -113,6 +145,14 @@ fs = {
         end,close=function() end}
     end,
 }
+function seed_file(path,value) files[path]=value end
+function filesystem_snapshot()
+    local snapshot={}
+    for _,entries in ipairs({files,directories}) do
+        for path,value in pairs(entries) do snapshot[path]=value end
+    end
+    return snapshot
+end
 local function record(path)
     return files[path] and textutils.unserialize(files[path]:match("\n(.*)$"))
 end
@@ -1548,6 +1588,191 @@ def absent_corrupt_torn_and_completed_checkpoints():
     r = sim.results()
     assert r["moves"] == before["moves"] and r["outputMined"] == before["outputMined"]
     assert "Saved job is completed" in r["printed"]
+    archived = dict(sim.g.filesystem_snapshot().items())
+    sim.command("archive")
+    assert dict(sim.g.filesystem_snapshot().items()) == relocated(archived)
+    assert sim.command(startup=True)[0] is None
+    assert sim.results()["moves"] == before["moves"]
+
+
+SAVE = "/.chunk_dig"
+ARCHIVE = SAVE + "-archive-"
+
+
+def relocated(snapshot, suffix="01"):
+    return {ARCHIVE + suffix + p[len(SAVE):] if p == SAVE or p.startswith(SAVE + "/") else p: v
+            for p, v in snapshot.items()}
+
+
+@test
+def archive_moves_the_entire_corrupt_job_and_auto_leaves_it_alone():
+    sim = Simulation(cuts=["before_move_down"])
+    assert sim.start()[0] == "POWER_CUT"
+    sim.g.corrupt_latest()
+    sim.g.fs.makeDir(SAVE + "/notes")
+    sim.g.seed_file(SAVE + "/notes/operator", "retain this too")
+    sim.g.seed_file(SAVE + "/0.tmp", "interrupted staged write")
+    sim.g.seed_file("/chunk_dig", "installed program")
+    sim.g.seed_file("/startup.lua", "existing startup")
+    sim.g.turtle.select(6)
+    saved = dict(sim.g.filesystem_snapshot().items())
+    assert all(SAVE + p in saved for p in ("/0", "/1", "/action", "/paired"))
+    before = sim.results()
+    sim.g.OPTIONS.rejectFileOpen = True
+    assert sim.command("archive")[0] is None
+    assert sim.results()["printed"][-1] == "Archived quarry job to " + ARCHIVE + "01"
+    assert dict(sim.g.filesystem_snapshot().items()) == relocated(saved)
+    sim.command("status")
+    assert sim.results()["printed"][-1] == "No saved quarry job"
+    assert sim.command(startup=True)[0] is None
+    after = sim.results()
+    for key in ("x", "y", "z", "heading", "moves", "minedItems", "selected", "invItems", "fuel"):
+        assert after[key] == before[key], key
+    assert dict(sim.g.filesystem_snapshot().items()) == relocated(saved)
+
+
+@test
+def archive_numbers_above_the_highest_suffix_and_never_overwrites_paths():
+    sim = Simulation()
+    sim.g.fs.makeDir(ARCHIVE + "01")
+    sim.g.seed_file(ARCHIVE + "01/note", "prior archive")
+    sim.g.seed_file(ARCHIVE + "03", "occupied by a file")
+    sim.g.seed_file(ARCHIVE + "99.tmp", "not a numbered archive")
+    for suffix in ("04", "100", "900719925474099300000"):
+        if suffix == "100":
+            sim.g.fs.makeDir(ARCHIVE + "99")
+        elif suffix != "04":
+            sim.g.fs.makeDir(ARCHIVE + "900719925474099299999")
+        sim.g.fs.makeDir(SAVE)
+        sim.g.seed_file(SAVE + "/action.tmp", "incomplete job")
+        saved = dict(sim.g.filesystem_snapshot().items())
+        sim.command("archive")
+        assert dict(sim.g.filesystem_snapshot().items()) == relocated(saved, suffix)
+        assert sim.results()["printed"][-1] == "Archived quarry job to " + ARCHIVE + suffix
+
+
+@test
+def archive_rejects_extra_arguments_non_directory_and_move_failure():
+    sim = Simulation(startItems=[("test:cargo", 3)])
+    sim.g.turtle.select(5)
+    saved = dict(sim.g.filesystem_snapshot().items())
+    sim.command("archive")
+    assert sim.results()["printed"][-1] == "No saved quarry job to archive."
+    assert dict(sim.g.filesystem_snapshot().items()) == saved
+    sim.g.seed_file(SAVE, "not a directory")
+    saved = dict(sim.g.filesystem_snapshot().items())
+    for args, expected in [(("archive", "extra"), "Usage: chunk_dig archive"),
+                           (("archive",), "not a directory"),
+                           (("new", "1"), "not a directory")]:
+        sim.command(*args)
+        assert expected in sim.results()["printed"][-1]
+        assert dict(sim.g.filesystem_snapshot().items()) == saved
+        assert sim.results()["selected"] == 5
+
+    sim = Simulation(cuts=["after_state_publish"])
+    assert sim.start()[0] == "POWER_CUT"
+    sim.g.OPTIONS.failArchiveMove = True
+    sim.g.turtle.select(5)
+    saved = dict(sim.g.filesystem_snapshot().items())
+    for args in [("archive",), ("new", "2")]:
+        sim.command(*args)
+        r = sim.results()
+        assert "injected archive move failure" in r["printed"][-1]
+        assert not any("Archived quarry job" in msg for msg in r["printed"])
+        assert dict(sim.g.filesystem_snapshot().items()) == saved
+        assert r["moves"] == 0 and r["selected"] == 5
+
+
+@test
+def new_without_prior_state_matches_numeric_start():
+    def native(value):
+        return {k: native(v) for k, v in value.items()} if hasattr(value, "items") else value
+
+    def start(args):
+        sim = Simulation(gps=True, cuts=["after_state_publish"])
+        assert sim.command(*args)[0] == "POWER_CUT"
+        assert not any(p.startswith(ARCHIVE) for p in sim.g.filesystem_snapshot().keys())
+        return native(sim.g.latest_record())
+
+    args = ("2", "Mining Quarry 02", "east")
+    assert start(("new", *args)) == start(args)
+
+
+@test
+def new_archives_the_old_job_and_uses_current_home_and_settings():
+    sim = Simulation(gps=True, anchor="north", cuts=["after_move:starting", "after_state_publish"])
+    assert sim.start()[0] == "POWER_CUT"
+    sim.g.turtle.turnRight()
+    assert (sim.results()["y"], sim.results()["heading"]) == (-1, 1)
+    old = sim.g.latest_record()["job"]
+    assert old["anchor"]["y"] == 64 and old["anchor"]["h"] == 0 and old["fuel"] == "top"
+    saved = dict(sim.g.filesystem_snapshot().items())
+    sim.command("2", "Refuse overwrite", "east")
+    assert "A saved quarry exists" in sim.results()["printed"][-1]
+    assert dict(sim.g.filesystem_snapshot().items()) == saved
+
+    sim.g.corrupt_latest()
+    saved = dict(sim.g.filesystem_snapshot().items())
+    sim.code = sim.code.replace('local FUEL_SIDE = "top"', 'local FUEL_SIDE = "back"')
+    assert sim.command("new", "2", "Mining Quarry 02", "east")[0] == "POWER_CUT"
+    r = sim.g.latest_record()
+    job = r["job"]
+    assert r["seq"] == 1 and job["layer"] == job["total"] == job["trips"] == 0
+    assert job["chunks"] == 2 and job["name"] == "Mining Quarry 02" and job["fuel"] == "back"
+    assert job["created"] != old["created"]
+    assert tuple(job["anchor"][k] for k in ("x", "y", "z", "h")) == (1000, 63, 2000, 1)
+    for field in ("home", "pos"):
+        assert tuple(job[field][k] for k in ("x", "y", "z", "h")) == (0, 0, 0, 0)
+    assert len(job["tasks"]) == 1 and job["tasks"][1]["stage"] == "start"
+    current = dict(sim.g.filesystem_snapshot().items())
+    assert {p: v for p, v in current.items() if p != SAVE and not p.startswith(SAVE + "/")} == relocated(saved)
+
+
+@test
+def new_preflight_errors_leave_prior_state_untouched():
+    sim = Simulation(cuts=["after_state_publish"])
+    assert sim.start()[0] == "POWER_CUT"
+    saved = dict(sim.g.filesystem_snapshot().items())
+    sim.g.turtle.select(5)
+    for args, expected in [
+        ((), "Usage: chunk_dig new"),
+        (("0",), "Invalid quarry size"), (("65",), "Invalid quarry size"),
+        (("1.5",), "Invalid quarry size"), (("x",), "Invalid quarry size"),
+        (("2", "Name", "up"), "Invalid quarry size or cardinal facing"),
+        (("2", "Name", "east", "extra"), "Usage: chunk_dig new"),
+        (("2", "a" * 201), "Job name is too long"),
+        (("2", "Name", "east"), "GPS home fix unavailable"),
+    ]:
+        sim.command("new", *args)
+        assert expected in sim.results()["printed"][-1]
+        assert sim.results()["selected"] == 5
+        assert dict(sim.g.filesystem_snapshot().items()) == saved
+    sim.code = sim.code.replace('local OUTPUT_SIDE = "back"', 'local OUTPUT_SIDE = "bottom"')
+    sim.command("new", "2")
+    assert "Invalid output or fuel side" in sim.results()["printed"][-1]
+    assert dict(sim.g.filesystem_snapshot().items()) == saved
+
+    sim = Simulation(limit=100, cuts=["after_state_publish"])
+    assert sim.start()[0] == "POWER_CUT"
+    saved = dict(sim.g.filesystem_snapshot().items())
+    sim.command("new", "2")
+    assert "fuel limit is 100" in sim.results()["printed"][-1]
+    assert dict(sim.g.filesystem_snapshot().items()) == saved
+
+
+@test
+def new_startup_failure_after_archive_does_not_restore_or_resume():
+    sim = Simulation(cuts=["after_state_publish"])
+    assert sim.start()[0] == "POWER_CUT"
+    saved = dict(sim.g.filesystem_snapshot().items())
+    sim.g.OPTIONS.failFreshDirectory = True
+    sim.command("new", "2")
+    r = sim.results()
+    assert r["printed"][-2:] == ["Archived quarry job to " + ARCHIVE + "01",
+                                   "error: injected fresh directory failure"]
+    assert r["moves"] == 0 and r["minedItems"] == 0
+    assert sim.command(startup=True)[0] is None
+    assert dict(sim.g.filesystem_snapshot().items()) == relocated(saved)
 
 
 def test_dashboard():

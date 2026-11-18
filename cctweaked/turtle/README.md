@@ -62,7 +62,7 @@ wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked
 chunk_dig 1 "Mining Quarry 01"
 ```
 
-Use the default sides for shared storage behind home. Start only while the turtle is at its base, facing the intended quarry. The first argument is the side length in chunks: `1` = 16×16, `2` = 32×32, `3` = 48×48 blocks. The optional second argument sets the job name; without it the turtle label is used. A new job refuses to replace existing state, even if the job is complete. Align the turtle to chunk boundaries yourself if needed, and note the home block's world coordinates and compass facing so you can verify a pending turn later even without GPS.
+Use the default sides for shared storage behind home. Start only while the turtle is at its base, facing the intended quarry. The first argument is the side length in chunks: `1` = 16×16, `2` = 32×32, `3` = 48×48 blocks. The optional second argument sets the job name; without it the turtle label is used. The plain numeric command refuses to replace existing state, even if the job is complete. See [Archive or start a different job](#archive-or-start-a-different-job) for the explicit replacement command. Align the turtle to chunk boundaries yourself if needed, and note the home block's world coordinates and compass facing so you can verify a pending turn later even without GPS.
 
 Optional GPS-anchored start, if the turtle is actually facing east:
 
@@ -206,11 +206,26 @@ Use the displayed generation in place of `123`. Use `before` only if the turtle 
 - **Inventory:** On reboot the live inventory and the persisted temporary fuel-buffer slot determine what is left to unload or refuel. A coal block delivered just before shutdown is burned on reboot before another delivery or unload; a partial unload continues from the slots that still contain cargo. Slot 1 is selected first on startup and restored after temporary selections.
 - **Limits:** The turtle filesystem and Minecraft world are not one transaction (see the [CC:Tweaked persistence discussion](https://github.com/cc-tweaked/CC-Tweaked/issues/535)). Don't manually relocate or turn the turtle, change its fuel buffer while a motion is unresolved, or restore its files separately from the world. An arbitrary server crash, world rollback, copied files, or changed terrain can invalidate a checkpoint. Leave room on the turtle filesystem for two checkpoints plus a staged write; larger footprints and long detours use more space.
 
-## Safely discard or archive a job
+## Archive or start a different job
 
-1. Stop the quarry with Ctrl+T if it is running, wait for movement to settle, and run `chunk_dig status`. Keep both checkpoint files and the journal together. If you need to recover the active job later, don't manually move, turn or refuel the turtle while its state is archived.
-2. Rename the whole directory to an unused archive name, for example `move /.chunk_dig /.chunk_dig-archive-01`. With the active directory gone, boot will not resume it. Keep the archive until you are sure you no longer need it; do not restore just one checkpoint.
-3. To start a different job, put the turtle at the intended base position and heading, confirm the fuel and output sides, then use the explicit `chunk_dig <chunks> [job name]` command. Don't start a new job from the turtle's mid-quarry position.
+Before running `archive` or `new`, stop the quarry with Ctrl+T and wait for movement to settle. To archive without restarting, run:
+
+```text
+chunk_dig archive
+chunk_dig status
+```
+
+`archive` moves the entire `/.chunk_dig` directory, including both checkpoints, the motion journal, and any other contents. It works with incomplete, corrupt, and completed jobs without opening the checkpoints. The first destination is `/.chunk_dig-archive-01`; later archives use one more than the highest existing numbered suffix, so `-01` and `-03` yield `-04`. It does not change the installed program or startup, and `auto` does not resume archived jobs. `status` should report no saved job after a successful archive.
+
+To archive and immediately start a **32×32** quarry, put the stopped turtle at the intended home and face it toward the new quarry before running this command. Confirm the output and fuel setup relative to that facing; do not run it from a mid-quarry position unless you deliberately intend that cell to become home.
+
+```text
+chunk_dig new 2 "Mining Quarry 02"
+```
+
+`new` accepts the same size, optional name, and optional GPS-facing argument as a numeric start. It checks the arguments, required GPS fix if requested, and initial fuel capacity before archiving. It then starts from the current position and facing using the installed script's configuration, not the archived settings. If there is no saved job, it starts without making an archive. If archiving fails, it does not start; if startup fails after the archive succeeds, the printed archive path remains available and the old job is not restored or resumed automatically.
+
+Keep the archive intact; do not restore individual checkpoint files. An archive preserves files, not the turtle's position, facing, fuel, or world state. Starting another job can invalidate the old job's recovery assumptions.
 
 ## Upgrading an existing quarry
 
@@ -251,7 +266,7 @@ pip install lupa
 python3 cctweaked/turtle/test_quarry.py
 ```
 
-The harness checks the existing quarry behavior and abandons the Lua coroutine around moves, turns, digs, transfers, checkpoint publication and phase changes. Collision tests simulate spare turtles in front, above, and below, including a second wait cycle, a turtle that arrives just before a dig or during a failed move, and reboot during home travel. Shared-inventory tests cover entry and reboot from all four headings, masked peripherals, sorting and virtual coal, and interrupted migration. These are simulated, not actual modded storage, block placement, or chunk unload/reload tests.
+The harness checks the existing quarry behavior and abandons the Lua coroutine around moves, turns, digs, transfers, checkpoint publication and phase changes. Collision tests simulate spare turtles in front, above, and below, including a second wait cycle, a turtle that arrives just before a dig or during a failed move, and reboot during home travel. Shared-inventory tests cover entry and reboot from all four headings, masked peripherals, sorting and virtual coal, and interrupted migration. Archive and new-job tests cover whole-directory preservation, numbering, invalid arguments and preflight failures, failed moves and fresh startup failures, and boot after archiving. These are simulated, not actual modded storage, block placement, or chunk unload/reload tests.
 
 To check your installed build, put a spare turtle in front of a stopped turtle and run `lua`, then `local ok,b=turtle.inspect(); print(ok,textutils.serialize(b))`. Repeat with both turtle types; the result reports the block ID and any inspectable tags. For an in-game collision smoke test, use a disposable quarry and place a spare turtle in the next front/up/down cell before resuming. Leave one through two checks and remove another during a pause. Check that the display stays on `WAITING TURTLE` until the next recheck, then the quarry continues without relocating the mining turtle.
 
