@@ -126,7 +126,7 @@ There is no fixed low-fuel threshold. The turtle records a route home through cl
 ## Return, unload, refuel, resume
 
 1. The turtle saves its exact cell, heading, and progress through the sweep.
-2. It travels home along recorded cleared cells: inside the current layer to where it entered, then back up through each layer's recorded route. These routes include any up or down steps from detours, so the turtle never assumes a straight path is open. If gravel or sand has fallen into a cleared quarry cell, it is dug again. Anything else blocking the route makes the turtle wait and report `blocked`.
+2. It travels home along recorded cleared cells: inside the current layer to where it entered, then back up through each layer's recorded route. These routes include any up or down steps from detours, so the turtle never assumes a straight path is open. If gravel or sand has fallen into a cleared quarry cell, it is dug again. Another turtle gets a dedicated `waiting_turtle` pause; other route obstructions report `blocked`.
 3. At home it burns carried coal blocks first as needed for the next departure, then other carried fuel if needed. It unloads all 16 slots, including surplus fuel, into the barrel. If the barrel cannot accept cargo, the turtle tries to draw and burn available coal blocks from the smallest coal stack to make room, then retries unloading. It finishes refuelling after unloading. On the final trip, it burns shared fuel only if needed to make unloading space and it can do so without overflowing.
 4. It returns along the same route in reverse and turns back to the saved heading. It checks that its position matches the saved one, then continues the same sweep. No cell is skipped or repeated, and it doesn't descend an extra layer.
 
@@ -139,6 +139,7 @@ The turtle keeps broadcasting telemetry while waiting.
 | `waiting_output` | Adjacent storage is unverified, full, or rejecting cargo. The detail also says why fuel could not free space. | Stays home with remaining cargo. Make room or fix insertion access; the turtle retries every `RETRY_SECONDS`. |
 | `waiting_fuel` | Not enough fuel for departure, and the wired fuel path could not deliver an extractable coal block. | Stays home. Fix the named missing capability, expose actual `minecraft:coal_block`, or supply coal blocks directly to the stopped turtle. |
 | `blocked` | A cleared route cell is occupied by something it may not dig, or a mob or entity won't move. | Retries every `RETRY_SECONDS`. |
+| `waiting_turtle` | Another turtle occupies the pending action's front, up, or down target. The dashboard shows the blocked direction and target. | Waits 60 seconds without moving, turning, digging, attacking, or advancing the checkpoint. It rechecks the same target and repeats if occupied. After reboot it rechecks before retrying the saved action. |
 | `error` | Separate-mode base inventories missing at start, round trip too large for the fuel limit, or another execution error. | Does not continue mining. Fix the reported issue before resuming. |
 | `stopped` | Terminated with Ctrl+T outside an uncertain motion. | Stops in place and retains the job. |
 | `recovering` / `resumed` | Loading and checking the saved job / verification passed. | Re-enters the exact saved work or service step. |
@@ -156,6 +157,7 @@ Other statuses: `starting`, `mining`, `returning_to_unload`, `returning_to_refue
 - Cells it cannot reach any way are skipped and counted in the log. The descent to the next layer is chosen from the cleared cell nearest home that has a diggable block below it.
 - The job is complete when no cell in the current layer has anything diggable below it.
 - `minecraft:bedrock` and all Allthemodium-family ores (`allthemodium:*ore*`) are never dug. Turtles cannot harvest those ores, so the quarry leaves them for you to mine by hand.
+- The quarry recognizes `computercraft:turtle_normal`, `computercraft:turtle_advanced`, and blocks with the `computercraft:turtle` tag ([CC:Tweaked Minecraft 1.21 block-tag data](https://raw.githubusercontent.com/cc-tweaked/CC-Tweaked/mc-1.21.x/projects/common/src/generated/resources/data/computercraft/tags/block/turtle.json)). It inspects immediately before every dig, but inspection and digging are separate [turtle API calls](https://tweaked.cc/mc-1.21.x/module/turtle.html), not an atomic compare-and-break. Avoid routing multiple working turtles through the same cell.
 - On completion the turtle returns home and unloads the final cargo. It waits as `waiting_output` if the barrel is full. It then turns to its original heading, selects slot 1, and reports `complete`. It keeps broadcasting until you press Ctrl+T.
 - The program does not remove liquids or block off lava.
 
@@ -249,6 +251,8 @@ pip install lupa
 python3 cctweaked/turtle/test_quarry.py
 ```
 
-The harness checks the existing quarry behavior and abandons the Lua coroutine around moves, turns, digs, transfers, checkpoint publication and phase changes. Shared-inventory tests cover entry and reboot from all four headings, upgrade sides masking adjacent peripherals, a block present without the inventory capability, output without a fuel dock, sorting and virtual coal, and interrupted migration. These are simulated, not actual modded storage, block placement, or chunk unload/reload tests.
+The harness checks the existing quarry behavior and abandons the Lua coroutine around moves, turns, digs, transfers, checkpoint publication and phase changes. Collision tests simulate spare turtles in front, above, and below, including a second wait cycle, a turtle that arrives just before a dig or during a failed move, and reboot during home travel. Shared-inventory tests cover entry and reboot from all four headings, masked peripherals, sorting and virtual coal, and interrupted migration. These are simulated, not actual modded storage, block placement, or chunk unload/reload tests.
+
+To check your installed build, put a spare turtle in front of a stopped turtle and run `lua`, then `local ok,b=turtle.inspect(); print(ok,textutils.serialize(b))`. Repeat with both turtle types; the result reports the block ID and any inspectable tags. For an in-game collision smoke test, use a disposable quarry and place a spare turtle in the next front/up/down cell before resuming. Leave one through two checks and remove another during a pause. Check that the display stays on `WAITING TURTLE` until the next recheck, then the quarry continues without relocating the mining turtle.
 
 For an in-game smoke test, use a sacrificial one-chunk job. Start with low fuel, non-fuel items before the coal in the shared inventory, and some cargo in the turtle. Check that the cargo is deposited, only coal blocks are withdrawn, and the dock reconnects on a return trip. Empty mined output as needed. Travel far enough to unload the turtle naturally, return, and check `chunk_dig status` or the dashboard.

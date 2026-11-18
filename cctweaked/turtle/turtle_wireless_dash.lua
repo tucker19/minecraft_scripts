@@ -30,6 +30,7 @@ local STATUS_COLOR = {
     refueling = colors.lightBlue,
     waiting_output = colors.orange,
     waiting_fuel = colors.orange,
+    waiting_turtle = colors.orange,
     blocked = colors.orange,
     complete = colors.cyan,
     recovering = colors.yellow,

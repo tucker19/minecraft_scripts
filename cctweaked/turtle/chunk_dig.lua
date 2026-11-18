@@ -418,6 +418,30 @@ end
 local function dirAPI(prefix,dir)
     return turtle[prefix .. (dir == "up" and "Up" or dir == "down" and "Down" or "")]
 end
+local function isTurtle(block)
+    return block.name=="computercraft:turtle_normal" or block.name=="computercraft:turtle_advanced"
+        or (block.tags and block.tags["computercraft:turtle"]==true)
+end
+local function inspectTarget(dir)
+    local inspect=dirAPI("inspect",dir)
+    local present,block=inspect()
+    local waited=false
+    while present and isTurtle(block) do
+        waited=true
+        local p=target(dir,S.pos)
+        announce("waiting_turtle",("%s blocked by %s at %d,%d,%d; rechecking in 60s")
+            :format(dir=="forward" and "front" or dir,block.name,p.x,p.y,p.z))
+        local deadline=os.clock()+60
+        while os.clock()<deadline do
+            sleep(math.min(5,deadline-os.clock()))
+            if os.clock()<deadline then telemetry() end
+        end
+        -- Only inspect this same face. Do not dispatch, change the route,
+        -- or write a checkpoint while the blocker is being polled.
+        present,block=inspect()
+    end
+    return present,block,waited
+end
 local function afterPose(op,p)
     if op == "right" or op == "left" then
         return pose(p.x,p.y,p.z,(p.h+(op == "right" and 1 or 3))%4)
@@ -429,6 +453,10 @@ local function motion(op)
     local after = afterPose(op,old)
     if not validPoint(after,true) then fail("Unsafe motion outside footprint") end
     local move = op ~= "right" and op ~= "left"
+    if move then
+        local present,block,waited=inspectTarget(op)
+        if waited or present then return nil end -- redispatch the same saved target
+    end
     pending = {seq=generation, job=S.created, op=op, before=old, after=after,
         fuel=turtle.getFuelLevel(), depth=#S.tasks, kind=task().kind}
     publish(DIR .. "/action","action",pending)
@@ -648,6 +676,20 @@ end
 local function waitFor(state,message)
     announce(state,message); sleep(S.retry)
 end
+local function guardedDig(dir,p)
+    -- Never trust the earlier inspection: a turtle can arrive while the
+    -- caller checks its cargo or retries a failed action.
+    local present,b,waited=inspectTarget(dir)
+    if waited or not present then return nil end
+    if not canDig(p,b.name) then return false,"protected block: " .. b.name end
+    return dirAPI("dig",dir)()
+end
+local function afterFailedMove(dir,label,why)
+    local present,_,waited=inspectTarget(dir)
+    if waited then return end
+    if not present then dirAPI("attack",dir)() end
+    waitFor("blocked",label .. " move failed: " .. tostring(why))
+end
 local function baseWait(t,stage,message)
     if t.stage~=stage then t.stage=stage; checkpoint() end
     waitFor(stage,message)
@@ -863,7 +905,8 @@ end
 local function mark(c,d,r)
     local p=S.pos
     local present,b=turtle.inspectDown()
-    local candidate=not present or canDig(target("down",p),b.name)
+    -- A parked turtle isn't permanent terrain; keep the descent candidate.
+    local candidate=not present or isTurtle(b) or canDig(target("down",p),b.name)
     setCell(c,p.x,p.z,2*(d*(side*side+1)+r)+(candidate and 1 or 0))
     c.count, S.total=c.count+1,S.total+1
 end
@@ -1003,19 +1046,17 @@ handlers.walk = function(t)
     if fuel()<#t.path-t.i+1 then fail("Insufficient fuel for remaining recorded travel; refuel in place before resuming") end
     local dir,h=direction(p)
     if h and not face(h) then return end
-    local present,b=dirAPI("inspect",dir)()
+    local present,b,waited=inspectTarget(dir)
+    if waited then return end
     if present then
         if canDig(p,b.name) and cargoSpace() then
-            local ok,why=dirAPI("dig",dir)()
-            if not ok then waitFor("blocked","Route dig failed: " .. tostring(why)) end
+            local ok,why=guardedDig(dir,p)
+            if ok==false then waitFor("blocked","Route dig failed: " .. tostring(why)) end
         else waitFor("blocked","Route obstructed by " .. b.name .. " at " .. p.x .. "," .. p.y .. "," .. p.z) end
         return
     end
     local ok,why=motion(dir)
-    if not ok then
-        dirAPI("attack",dir)()
-        waitFor("blocked","Route move failed: " .. tostring(why))
-    end
+    if ok==false then afterFailedMove(dir,"Route",why) end
 end
 handlers.mine = function(t)
     if t.moved then return pop(true) end
@@ -1024,17 +1065,18 @@ handlers.mine = function(t)
     if not isolated and budget(homeCost()+2+S.margin) then return true end
     local dir,h=direction(t.p)
     if h and not face(h) then return end
-    local present,b=dirAPI("inspect",dir)()
+    local present,b,waited=inspectTarget(dir)
+    if waited then return end
     if present then
         if not canDig(t.p,b.name) then return pop(false) end
         if isolated then
             if not cargoSpace() then return pop(nil) end
         elseif room() then return true end
-        local ok=dirAPI("dig",dir)()
-        if not ok then
-            if t.mode=="below" then return pop(false) end
-            local still=dirAPI("inspect",dir)()
-            if still then return pop(false) end
+        local ok=guardedDig(dir,t.p)
+        if ok==false then
+            local still,_,paused=inspectTarget(dir)
+            if paused then return end
+            if t.mode=="below" or still then return pop(false) end
         end
         -- Reinspect on the next dispatch, including after a successful dig
         -- or reboot. This also handles another gravity block falling in.
@@ -1042,10 +1084,7 @@ handlers.mine = function(t)
     end
     if t.mode=="below" then return pop(true) end
     local ok,why=motion(dir)
-    if not ok then
-        dirAPI("attack",dir)()
-        waitFor("blocked","Mining move failed: " .. tostring(why))
-    end
+    if ok==false then afterFailedMove(dir,"Mining",why) end
 end
 
 handlers.base = function(t)

@@ -26,6 +26,8 @@ local slots = {}
 for i = 1, 16 do slots[i] = nil end
 local selected = 1
 local removed, visited = {}, {}
+local spare, turtleInspections, waitPackets = {}, {}, {}
+local turnCount, digCount, attackCount = 0,0,0
 local violations = {}
 local packets, statuses = {}, {}
 local last = nil
@@ -213,6 +215,7 @@ for _, c in ipairs(O.atm or {}) do atm[key(c[1], c[2], c[3])] = true end
 
 local function blockAt(x, y, z)
     local k = key(x, y, z)
+    if spare[k] and T<spare[k].untilTime then return spare[k].name end
     if storage[k]=="dock" then return "computercraft:wired_modem_full" end
     if storage[k] then return storage[k]=="shared" and "modded:item_storage" or "minecraft:barrel" end
     if removed[k] then return nil end
@@ -239,6 +242,15 @@ local function coord(dir)
     if dir == "down" then return px, py - 1, pz end
     local d = VEC[hd]
     return px + d[1], py, pz + d[2]
+end
+local function parkTurtle(dir,name,seconds,tagged)
+    local x,y,z=coord(dir)
+    spare[key(x,y,z)]={name=name,untilTime=seconds and T+seconds or math.huge,tagged=tagged}
+end
+function park_turtle(...) parkTurtle(...) end
+local function occupiedByTurtle(x,y,z)
+    local b=spare[key(x,y,z)]
+    return b and T<b.untilTime and b
 end
 
 local function tick(n)
@@ -299,6 +311,12 @@ move = function(dir)
     requireSlot1("move " .. dir)
     if fuel ~= "unlimited" and fuel <= 0 then return false, "Out of fuel" end
     local x, y, z = coord(dir)
+    if O.arriveOnMove==dir then
+        O.arriveOnMove=nil
+        parkTurtle(dir,"computercraft:turtle_advanced",15)
+        return false,"Movement obstructed"
+    end
+    if occupiedByTurtle(x,y,z) then v("attempted move into spare turtle") end
     if blockAt(x, y, z) then return false, "Movement obstructed" end
     if O.failEvery then
         failCounter = failCounter + 1
@@ -333,10 +351,12 @@ move = function(dir)
 end
 
 local function dig(dir)
+    digCount=digCount+1
     fault("before_dig")
     tick()
     requireSlot1("dig " .. dir)
     local x, y, z = coord(dir)
+    if occupiedByTurtle(x,y,z) then v("attempted to dig spare turtle"); return false end
     local name = blockAt(x, y, z)
     if not name then return false, "Nothing to dig here" end
     if storage[key(x, y, z)] then
@@ -361,7 +381,17 @@ end
 
 local function inspect(dir)
     tick(0.01)
-    local name = blockAt(coord(dir))
+    local x,y,z=coord(dir)
+    local b=occupiedByTurtle(x,y,z)
+    local name=blockAt(x,y,z)
+    if b then
+        turtleInspections[#turtleInspections+1]={time=T,dir=dir,gen=latest_record().seq}
+        return true,{name=b.name,tags=b.tagged and {["computercraft:turtle"]=true} or nil}
+    end
+    if O.arriveAfterInspect==dir and py<0 then
+        O.arriveAfterInspect=nil
+        parkTurtle(dir,"test:tagged_robot",15,true)
+    end
     if name then return true, {name = name} end
     return false, "No block to inspect"
 end
@@ -595,6 +625,10 @@ rednet = {
                 .. "," .. pz .. " h" .. hd)
         end
         if p.inventory.totalSlots ~= 16 then v("totalSlots ~= 16") end
+        if p.status=="waiting_turtle" then
+            waitPackets[#waitPackets+1]={time=T,pose=key(px,py,pz)..":"..hd,gen=latest_record().seq,
+                moves=moveCount,turns=turnCount,digs=digCount,attacks=attackCount,fuel=fuel}
+        end
         if p.location.gps and p.location.gps.moved then gpsMovedSeen = true end
         if not last or last.status ~= p.status then
             statuses[#statuses + 1] = p.status
@@ -603,7 +637,7 @@ rednet = {
                     inTrip = true
                     pendingResume = {px, py, pz, hd}
                     if p.detail == "no empty cargo slot" then cargoDetail = true end
-                elseif not last or (last.status~="resumed" and last.status~="blocked") then
+                elseif not last or (last.status~="resumed" and last.status~="blocked" and last.status~="waiting_turtle") then
                     nestedTrips = nestedTrips + 1
                 end
             elseif p.status == "mining" and pendingResume then
@@ -695,14 +729,14 @@ turtle = {
     up = function() return move("up") end,
     down = function() return move("down") end,
     turnRight = function()
-        fault("before_turn"); tick(); hd=(hd+1)%4; fault("after_turn"); return true
+        fault("before_turn"); tick(); turnCount=turnCount+1; hd=(hd+1)%4; fault("after_turn"); return true
     end,
     turnLeft = function()
-        fault("before_turn"); tick(); hd=(hd+3)%4; fault("after_turn"); return true
+        fault("before_turn"); tick(); turnCount=turnCount+1; hd=(hd+3)%4; fault("after_turn"); return true
     end,
-    attack = function() return false end,
-    attackUp = function() return false end,
-    attackDown = function() return false end,
+    attack = function() attackCount=attackCount+1; return false end,
+    attackUp = function() attackCount=attackCount+1; return false end,
+    attackDown = function() attackCount=attackCount+1; return false end,
     drop = function(c) return drop("forward", c) end,
     dropUp = function(c) return drop("up", c) end,
     dropDown = function(c) return drop("down", c) end,
@@ -744,6 +778,7 @@ function results()
         baseBurnsWrongSlot = baseBurnsWrongSlot,
         fuel = fuel, wastedFuel = wastedFuel, gpsMovedSeen = gpsMovedSeen,
         moves = moveCount, minedCoalBurned = minedCoalBurned,
+        turtleInspections=turtleInspections, waitPackets=waitPackets, attacks=attackCount,
         outputCoal = outputItems["minecraft:coal"] or 0,
         cutCount = cutIndex-1, printed = printed,
         wirePushes=wirePushes, blindSucks=blindSucks, wrongPushes=wrongPushes,
@@ -1362,6 +1397,80 @@ def resume_drains_a_previously_queued_move_before_reconciling():
     assert not manual and r["minedItems"] == r["outputMined"]
 
 
+def check_turtle_wait(r, direction, minimum=60):
+    packets = list(r["waitPackets"].values())
+    assert packets and packets[-1]["time"] - packets[0]["time"] >= minimum - 6
+    for field in ("pose", "gen", "moves", "turns", "digs", "attacks", "fuel"):
+        assert all(p[field] == packets[0][field] for p in packets), field
+    assert max(b["time"] - a["time"] for a, b in zip(packets, packets[1:])) < 11
+    assert any(f"waiting_turtle: {direction} blocked by" in p for p in r["printed"])
+    assert not r["violations"], r["violations"]
+    return packets
+
+
+@test
+def collision_down_waits_two_cycles_without_progress():
+    sim = Simulation(cuts=["before_dig"])
+    sim.g.park_turtle("down", "computercraft:turtle_normal", 70)
+    assert sim.start()[0] == "POWER_CUT"
+    r = sim.results()
+    packets = check_turtle_wait(r, "down", 120)
+    checks = list(r["turtleInspections"].values())
+    assert len(checks) == 2 and all(c["dir"] == "down" for c in checks)
+    assert 60 <= checks[1]["time"] - checks[0]["time"] < 61
+    assert sim.g.latest_record()["seq"] == packets[0]["gen"]
+    assert r["moves"] == r["minedItems"] == r["attacks"] == 0
+    assert sim.command(startup=True)[0] == "TEST_END"
+    check_complete(sim.results(), "quarry after downward turtle clears")
+
+
+@test
+def collision_front_arrives_between_initial_inspect_and_dig():
+    sim = Simulation(arriveAfterInspect="forward",
+                     cuts=["phase:waiting_turtle", "before_dig"])
+    assert sim.start()[0] == "POWER_CUT"
+    r = sim.results()
+    assert r["last"]["status"] == "waiting_turtle" and "test:tagged_robot" in r["last"]["detail"]
+    saved = sim.g.latest_record()["seq"]
+    assert sim.command(startup=True)[0] == "POWER_CUT"
+    r = sim.results()
+    check_turtle_wait(r, "front")
+    assert sim.g.latest_record()["seq"] == saved
+    assert r["moves"] == 1 and r["minedItems"] == 1 and r["attacks"] == 0
+
+
+@test
+def collision_after_failed_move_does_not_attack_or_dig_turtle():
+    sim = Simulation(arriveOnMove="down", cuts=["after_move_down"])
+    assert sim.start()[0] == "POWER_CUT"
+    r = sim.results()
+    check_turtle_wait(r, "down")
+    assert r["moves"] == r["minedItems"] == 1 and r["attacks"] == 0
+
+
+@test
+def collision_rechecks_travel_target_on_reboot_to_and_from_home():
+    for direction, phase in [("up", "returning_to_unload"), ("down", "resuming")]:
+        sim = Simulation(manyItems=True, cuts=[f"before_move_{direction}:{phase}",
+                         "sleep:waiting_turtle", f"after_move_{direction}:{phase}"])
+        assert sim.start()[0] == "POWER_CUT"
+        sim.g.park_turtle(direction, "computercraft:turtle_advanced", 30)
+        before = sim.results()
+        saved = sim.g.latest_record()["seq"]
+        assert sim.command(startup=True)[0] == "POWER_CUT"
+        assert sim.results()["last"]["status"] == "waiting_turtle"
+        # Recovery first resolves the previously journaled but unexecuted
+        # move. It can commit that result, but the wait itself must not.
+        assert sim.g.latest_record()["seq"] == saved + 1
+        assert sim.command(startup=True)[0] == "POWER_CUT"
+        r = sim.results()
+        check_turtle_wait(r, direction)
+        assert r["moves"] == before["moves"] + 1 and r["attacks"] == before["attacks"]
+        assert r["minedItems"] == before["minedItems"]
+        assert sim.command(startup=True)[0] == "TEST_END"
+        check_complete(sim.results(), f"travel resumed after {direction} turtle")
+
+
 @test
 def gps_anchors_unlimited_moves_but_not_turns():
     cuts = ["before_move:starting", "after_move:starting",
@@ -1511,8 +1620,14 @@ def test_dashboard():
             elseif event == 7 then
                 assert(table.concat(lines,"\n"):find("RECOVERING"))
                 return "rednet_message",1,pkt(1,"resumed"),"turtle_quarry_v1"
+            elseif event == 8 then
+                assert(table.concat(lines,"\n"):find("RESUMED"))
+                local p=pkt(1,"waiting_turtle")
+                p.detail="up blocked by computercraft:turtle_normal"
+                return "rednet_message",1,p,"turtle_quarry_v1"
             end
-            assert(table.concat(lines,"\n"):find("RESUMED"))
+            local all=table.concat(lines,"\n")
+            assert(all:find("WAITING TURTLE") and all:find("up blocked by",1,true),all)
             error("TEST_END")
         end
     ''')
