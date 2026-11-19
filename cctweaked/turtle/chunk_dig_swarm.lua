@@ -8,9 +8,14 @@ assert(not fs.exists("/.chunk_dig"),"Standalone quarry save exists; swarm will n
 local M=assert(loadfile(fs.combine(fs.getDir(shell.getRunningProgram()),"swarm_common.lua")))()
 local c=M.config("/chunk_dig_swarm.json")
 M.xyz(c.staging)
-local heading=({north=0,east=1,south=2,west=3})[c.facing]
+local headings={north=0,east=1,south=2,west=3}
+local heading=headings[c.facing]
+local serviceBelow=c.serviceBelow or 800
 assert(heading and type(c.coordinator)=="number" and c.coordinator%1==0 and c.coordinator>=0
     and type(c.quarryId)=="string" and type(c.manifestId)=="string" and type(c.dimension)=="string"
+    and (c.sharedStation==nil or type(c.sharedStation)=="boolean")
+    and type(serviceBelow)=="number" and serviceBelow%1==0 and serviceBelow>=0 and serviceBelow<=1000000
+    and not (c.sharedStation and c.output)
     and (c.output==nil or c.output=="top" or c.output=="front"),"invalid swarm worker configuration")
 local me=os.getComputerID()
 local DIR="/.chunk_dig_swarm"
@@ -93,13 +98,15 @@ local function report(force)
     rednet.broadcast({
         type="quarry",version=1,id=me,name=os.getComputerLabel() or ("Swarm "..me),
         status=state,detail=detail,fuel=turtle.getFuelLevel(),fuelLimit=turtle.getFuelLimit(),
-        fuelType="carried fuel",reserve=math.max(0,#s.trail-1),
+        fuelType=c.sharedStation and "shared coal station" or "carried fuel",
+        reserve=#s.trail-1+(s.grant and s.grant.serviceReserve or 0),
         job={layer=ay-y,layerCleared=cleared,layerBlocked=blocked,cells=cleared,
             area=s.grant and #s.grant.cells or 0},
         inventory={usedSlots=used,totalSlots=16,percent=used*100/16,items=items},
         location={relative={x=f,y=y-ay,z=r},heading=(s.heading-heading)%4},
         swarm={quarryId=s.quarryId,assignmentId=s.grant and s.grant.id,
-            area=s.grant and (s.grant.cells[1].." +"..(#s.grant.cells-1).." cells"),
+            area=s.grant and (s.grant.station and ("service bay "..s.grant.route[#s.grant.route])
+                or (s.grant.cells[1].." +"..(#s.grant.cells-1).." cells")),
             waitingReason=reason}
     },M.telemetry)
 end
@@ -134,8 +141,18 @@ end
 local function checkGrant(g)
     assert(type(g)=="table" and g.worker==me and type(g.id)=="number" and g.id>=1 and g.id%1==0
         and type(g.fuelNeed)=="number" and g.fuelNeed%1==0
-        and #g.route>=1 and #g.cells>=1 and #g.cells<=256 and g.route[1]==s.stage
+        and #g.route>=1 and #g.cells<=256 and g.route[1]==s.stage
         and g.fuelNeed>=2*(#g.route-1+#g.cells),"invalid swarm grant")
+    if g.station then
+        assert(c.sharedStation and #g.route>1 and #g.cells==0 and not g.serviceReserve
+            and headings[g.station.facing] and type(g.station.fuelTarget)=="number"
+            and g.station.fuelTarget%1==0 and g.station.fuelTarget>=1 and g.station.fuelTarget<=1000000,
+            "invalid shared station grant")
+    else
+        local reserve=g.serviceReserve or 0
+        assert(#g.cells>=1 and type(reserve)=="number" and reserve%1==0 and reserve>=0
+            and g.fuelNeed>=2*(#g.route-1+#g.cells)+reserve,"invalid mining grant")
+    end
     local used={}
     for i,p in ipairs(g.route) do
         M.xyz(p); assert(not used[p],"overlapping route")
@@ -161,8 +178,10 @@ end
 
 local function sameGrant(a,b)
     checkGrant(b)
-    if a.id~=b.id or a.fuelNeed~=b.fuelNeed
+    if a.id~=b.id or a.fuelNeed~=b.fuelNeed or a.serviceReserve~=b.serviceReserve
+        or (a.station~=nil)~=(b.station~=nil)
         or #a.route~=#b.route or #a.cells~=#b.cells then return false end
+    if a.station and (a.station.facing~=b.station.facing or a.station.fuelTarget~=b.station.fuelTarget) then return false end
     for i,p in ipairs(a.route) do if b.route[i]~=p then return false end end
     for i,p in ipairs(a.cells) do if b.cells[i]~=p then return false end end
     return true
@@ -260,6 +279,12 @@ local function step(to,mine,back)
 end
 
 local allowedFuel={["minecraft:coal_block"]=true,["minecraft:coal"]=true,["minecraft:charcoal"]=true}
+local function cargoSlot()
+    for i=1,16 do
+        local d=turtle.getItemDetail(i)
+        if d and not allowedFuel[d.name] then return i end
+    end
+end
 local function service()
     local cap=turtle.getFuelLimit()
     local values={["minecraft:coal_block"]=800,["minecraft:coal"]=80,["minecraft:charcoal"]=80}
@@ -283,6 +308,89 @@ local function service()
     turtle.select(1)
 end
 
+local function settleStationFuel()
+    local slot=s.stationFuelSlot
+    if not slot then return end
+    local got=turtle.getItemDetail(slot)
+    if got then
+        assert(got.name=="minecraft:coal_block" and got.count==1,
+            "Unexpected item in station fuel slot "..slot.."; fix it before resuming")
+        local before=fuel()
+        turtle.select(slot)
+        assert(turtle.refuel(1) and fuel()>before and turtle.getItemCount(slot)==0,
+            "Cannot burn station coal block in saved fuel slot")
+    end
+    turtle.select(1)
+    s.stationFuelSlot=nil; commit(s)
+end
+
+local function stationStep(g)
+    local station=g.station
+    assert(pos()==g.route[#g.route] and not s.request,"station access outside active bay")
+    if not face(headings[station.facing]) then return end
+    if not s.bayVerified then
+        assert(locate()==pos(),"GPS cannot verify the service bay")
+        s.bayVerified=true; commit(s)
+    end
+    local slot
+    for i=1,16 do if turtle.getItemCount(i)>0 then slot=i; break end end
+    if slot then
+        local present,_,paused=inspect("")
+        if paused then return end
+        if not present or not peripheral.hasType("front","inventory") then
+            announce("waiting_output","Shared station output inventory is missing","station_output_missing")
+            sleep(5); return
+        end
+        announce("unloading","Unloading at shared station")
+        turtle.select(slot)
+        turtle.drop()
+        turtle.select(1)
+        if turtle.getItemCount(slot)>0 then
+            announce("waiting_output","Shared station output is full or rejects cargo","station_output_full")
+            sleep(5)
+        end
+        return
+    end
+    local limit=turtle.getFuelLimit()
+    local distance=#g.route-1
+    local target=limit=="unlimited" and math.huge or math.min(limit,station.fuelTarget+distance)
+    if fuel()>=target then s.returning=true; s.stationComplete=true; commit(s); return end
+    local present,_,paused=inspect("Up")
+    if paused then return end
+    if not present or not peripheral.hasType("top","inventory") then
+        announce("waiting_fuel","Shared station coal-block inventory is missing","station_fuel_missing")
+        sleep(5); return
+    end
+    local items=peripheral.call("top","list")
+    local available=false
+    for _,d in pairs(items) do
+        if d.name~="minecraft:coal_block" then
+            announce("waiting_fuel","Station fuel inventory must contain only coal blocks","station_fuel_contaminated")
+            sleep(5); return
+        end
+        available=true
+    end
+    if not available then
+        announce("waiting_fuel","Shared station is out of coal blocks","station_fuel_empty")
+        sleep(5); return
+    end
+    for i=1,16 do if turtle.getItemCount(i)==0 then slot=i; break end end
+    if not slot then
+        announce("waiting_fuel","No empty inventory slot for a station coal block","station_fuel_no_slot")
+        sleep(5); return
+    end
+    announce("refueling","Taking a coal block at shared station")
+    s.stationFuelSlot=slot; commit(s)
+    turtle.select(slot)
+    local ok=turtle.suckUp(1)
+    assert(not ok or turtle.getItemCount(slot)>0,"Station fuel arrived outside the saved fuel slot")
+    settleStationFuel()
+    if not ok then
+        announce("waiting_fuel","Station fuel inventory rejected extraction","station_fuel_rejected")
+        sleep(5)
+    end
+end
+
 local function request(kind,fields)
     s.seq=s.seq+1
     fields.kind,fields.seq=kind,s.seq
@@ -294,6 +402,16 @@ local children=s.grant and checkGrant(s.grant)
 local function checkTrail()
     assert(s.trail[1]==s.stage and #s.trail>=1 and type(s.heading)=="number"
         and s.heading%1==0 and s.heading>=0 and s.heading<=3,"invalid saved trail")
+    if s.bayVerified or s.stationFuelSlot or s.stationComplete then
+        assert(s.grant and s.grant.station,"station state without a service grant")
+        assert(not s.stationComplete or (s.bayVerified and s.returning),"invalid completed service")
+        if s.stationFuelSlot then
+            assert(s.bayVerified and pos()==s.grant.route[#s.grant.route] and not s.returning
+                and not s.request and not s.motion and s.heading==headings[s.grant.station.facing]
+                and type(s.stationFuelSlot)=="number" and s.stationFuelSlot%1==0
+                and s.stationFuelSlot>=1 and s.stationFuelSlot<=16,"invalid saved station fuel slot")
+        end
+    end
     if not s.grant then
         assert(#s.trail==1 and not s.motion,"saved motion without assignment")
         return
@@ -332,6 +450,12 @@ s.boot=s.boot+1
 commit(s)
 M.openModem()
 local verifiedGrant=not s.grant
+local waiting={
+    station_not_configured="Shared station is not configured on the coordinator",
+    station_busy="Shared bay or its route is reserved; waiting at staging",
+    station_fuel_reserve="Add starter fuel at staging; not enough for a round trip to the shared bay",
+    patch_fuel="Not enough fuel for the reachable patch and the required return reserve"
+}
 while true do
     if s.request then
         assert(pos()==s.stage and not s.motion and s.heading==heading,"invalid pending staging request")
@@ -342,24 +466,36 @@ while true do
             assert(reply.seq==s.request.seq,"wrong coordinator sequence")
             if s.request.kind=="finish" then
                 assert(s.grant and reply.finished==s.grant.id,"wrong finish acknowledgement")
+                if s.stationComplete then s.lastStationFuel=turtle.getFuelLevel() end
+                s.bayVerified,s.stationComplete=nil,nil
                 s.grant,s.outcomes,s.returning,children=nil,nil,nil,nil
             elseif reply.grant then
-                assert(not s.grant,"cannot replace an active assignment")
+                assert(not s.grant and (reply.grant.station~=nil)==(s.request.kind=="service"),
+                    "unexpected grant type or existing assignment")
                 children=checkGrant(reply.grant)
                 s.grant,s.outcomes=reply.grant,{}
+                if not s.grant.station then s.lastStationFuel=nil end
+                s.needsStationFuel=nil
                 lastSync=os.clock()
                 verifiedGrant=true
+            elseif reply.reason=="patch_fuel" and c.sharedStation then
+                s.needsStationFuel=true
             end
             s.request=nil; commit(s)
             if reply.reason then
-                announce("waiting_swarm","No reachable unclaimed patch with current route and fuel",reply.reason)
+                announce("waiting_swarm",waiting[reply.reason] or "No reachable unclaimed patch with current route and fuel",reply.reason)
                 sleep(5)
             end
         end
     elseif not s.grant then
         assert(pos()==s.stage and s.heading==heading and locate()==s.stage,"not at verified staging")
         service()
-        if not emptySlot() then
+        local level=turtle.getFuelLevel()
+        local tried=s.lastStationFuel==level
+        if c.sharedStation and (cargoSlot() or not emptySlot()
+                or (not tried and (s.needsStationFuel or fuel()<serviceBelow))) then
+            request("service",{fuel=level})
+        elseif not emptySlot() then
             announce("waiting_output","Empty cargo at staging or configure an adjacent output inventory","no_empty_slot")
             sleep(5)
         else request("claim",{fuel=turtle.getFuelLevel()}) end
@@ -367,11 +503,15 @@ while true do
         if sync() then verifiedGrant=true
         else announce("waiting_swarm","Cannot verify saved assignment; holding position","coordinator_unreachable"); sleep(2) end
     else
+        local g=s.grant
+        if s.stationFuelSlot then settleStationFuel() end
         local connected=not s.returning and sync()
         if not connected and not s.returning then s.returning=true; commit(s) end
-        local g=s.grant
-        if not s.returning and (not emptySlot() or (#s.trail==1 and fuel()<g.fuelNeed)
-                or fuel()<#s.trail+1) then s.returning=true; commit(s) end
+        if not s.returning and ((#s.trail==1 and fuel()<g.fuelNeed)
+                or (g.station and #s.trail<#g.route and fuel()<#s.trail+1)
+                or (not g.station and (not emptySlot() or fuel()<#s.trail+1+(g.serviceReserve or 0)))) then
+            s.returning=true; commit(s)
+        end
         if s.returning then
             if #s.trail>1 then
                 assert(fuel()>=#s.trail-1,"insufficient fuel for return; held in reserved space")
@@ -385,8 +525,10 @@ while true do
         else
             local index=#s.trail
             if index<#g.route then
-                announce("resuming","Travelling to assigned patch")
+                announce("resuming",g.station and "Travelling to reserved shared station" or "Travelling to assigned patch")
                 step(g.route[index+1],false,false)
+            elseif g.station then
+                stationStep(g)
             else
                 local nextCell
                 for _,p in ipairs(children[pos()] or {}) do if not s.outcomes[p] then nextCell=p; break end end

@@ -121,6 +121,36 @@ class PatchQueueTests(unittest.TestCase):
             assert(not reopen():claim(1,1,a,6))
         """)
 
+    def test_station_enable_preserves_work_and_shares_the_mining_route_lock(self):
+        self.lua.execute("""
+            local a,b,hub,bay="0,0,0","2,0,0","1,0,0","1,0,1"
+            local done,shared,behind="0,1,0","1,-1,0","1,-1,1"
+            local q=create({a,b},{a,b,hub},{done,shared,behind},1,1)
+            local config={bay=bay,facing="south",fuelTarget=900,
+                routes={[a]={a,hub,bay},[b]={b,hub,bay}}}
+            local g=assert(claim(q,1,1,a,20).grant)
+            assert(not pcall(Queue.withStation,q.state,config,{bay}))
+            assert(q:finish(1,2,a,g.id,{[done]="clear"}))
+            assert(not pcall(Queue.withStation,q.state,config,{bay,"1,1,1"}))
+            assert(commit(Queue.withStation(q.state,config,{bay})))
+            q=reopen()
+            assert(q.state.work[done]=="clear" and q.state.nextId==g.id+1)
+            assert(claim(q,1,3,a,9).reason=="patch_fuel")
+            local mine=assert(claim(q,1,4,a,10).grant)
+            assert(mine.route[2]==hub and mine.cells[1]==shared and mine.serviceReserve==5)
+            assert(q:service(2,1,b,20).reason=="station_busy")
+            assert(q:finish(1,5,a,mine.id,{}))
+            local service=assert(q:service(2,2,b,20).grant)
+            assert(claim(q,1,6,a,20).reason=="no_safe_patch")
+            assert(not q:finish(2,3,b,service.id,{[shared]="clear"}))
+            assert(q:finish(2,3,b,service.id,{}))
+            assert(not q:service(2,2,b,20))
+            local mine2=assert(claim(q,1,7,a,20).grant)
+            assert(q:finish(1,8,a,mine2.id,{[shared]="blocked"}))
+            assert(claim(q,1,9,a,20).reason=="no_safe_patch")
+            assert(q.state.work[behind]=="unclaimed") -- never traverse the bay to mine
+        """)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

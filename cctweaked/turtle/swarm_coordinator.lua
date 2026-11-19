@@ -1,6 +1,7 @@
--- Dashboard computer: swarm_coordinator init|run [config.json]
+-- Dashboard computer: swarm_coordinator init|run|enable-station [config.json]
 local mode,path=...
-assert(mode=="init" or mode=="run","Usage: swarm_coordinator init|run [config.json]")
+assert(mode=="init" or mode=="run" or mode=="enable-station",
+    "Usage: swarm_coordinator init|run|enable-station [config.json]")
 assert(not turtle,"Run the coordinator on a dashboard computer")
 local dir=fs.getDir(shell.getRunningProgram())
 local M=assert(loadfile(fs.combine(dir,"swarm_common.lua")))()
@@ -30,6 +31,12 @@ end
 state,commit=M.store(STATE)
 assert(state.quarryId==c.quarryId and state.manifestId==c.manifestId and state.dimension==c.dimension,
     "config does not match the saved quarry manifest")
+if mode=="enable-station" then
+    commit(Queue.withStation(state,c.station,c.clearApproach))
+    print("Shared station added to existing swarm; run swarm_coordinator run")
+    return
+end
+assert(not c.station or state.station,"station is not installed in the ledger; run enable-station")
 local q=Queue.open(state,commit)
 M.openModem()
 print("Coordinating swarm "..state.quarryId.." on computer "..os.getComputerID())
@@ -44,6 +51,8 @@ while true do
         local result,why
         if m.kind=="claim" then
             result,why=q:claim(sender,m.seq,m.stage,m.fuel)
+        elseif m.kind=="service" then
+            result,why=q:service(sender,m.seq,m.stage,m.fuel)
         elseif m.kind=="finish" then
             -- Trusted worker emits this only from a persisted, disarmed terminal checkpoint.
             result,why=q:finish(sender,m.seq,m.stage,m.id,m.evidence)
