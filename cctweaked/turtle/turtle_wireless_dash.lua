@@ -100,11 +100,17 @@ local function draw()
             .. tostring(d.fuelType), colors.orange)
 
         local j = d.job or {}
-        row(y + 2, string.format(
-            "Job: %sx%s chunks (%sx%s) | layer %s: %s/%s cells, %s blocked",
-            j.chunks or "?", j.chunks or "?", j.side or "?", j.side or "?",
-            j.layer or "?", j.layerCleared or "?", j.area or "?",
-            j.layerBlocked or 0))
+        local swarm = type(d.swarm)=="table" and d.swarm
+        if swarm then
+            row(y + 2, ("Swarm: %s | #%s | %s"):format(tostring(swarm.quarryId or "?"),
+                tostring(swarm.assignmentId or "-"),tostring(swarm.area or "staging")))
+        else
+            row(y + 2, string.format(
+                "Job: %sx%s chunks (%sx%s) | layer %s: %s/%s cells, %s blocked",
+                j.chunks or "?", j.chunks or "?", j.side or "?", j.side or "?",
+                j.layer or "?", j.layerCleared or "?", j.area or "?",
+                j.layerBlocked or 0))
+        end
         row(y + 3, string.format("Total cleared: %s cells | service trips: %s",
             j.cells or "?", j.trips or 0))
 
@@ -122,7 +128,11 @@ local function draw()
 
         local gtext, gcol = gpsLine(loc, d.received)
         row(y + 6, gtext, gcol)
-        row(y + 7, tostring(d.detail or ""):match("^[^\r\n]*"), colors.gray)
+        local detail=tostring(d.detail or "")
+        if swarm and type(swarm.waitingReason)=="string" and swarm.waitingReason~="" then
+            detail=swarm.waitingReason..": "..detail
+        end
+        row(y + 7, detail:match("^[^\r\n]*"), colors.gray)
     end
 
     row(h, "Left/right or scroll: pages | touch: next", colors.gray)

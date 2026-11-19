@@ -1850,9 +1850,17 @@ def test_dashboard():
                 local p=pkt(1,"waiting_turtle")
                 p.detail="up blocked by computercraft:turtle_normal"
                 return "rednet_message",1,p,"turtle_quarry_v1"
+            elseif event == 9 then
+                local all=table.concat(lines,"\n")
+                assert(all:find("WAITING TURTLE") and all:find("up blocked by",1,true),all)
+                local p=pkt(1,"waiting_swarm")
+                p.swarm={quarryId="pit-01",assignmentId=7,area="100,70,200 +3 cells",
+                    waitingReason="coordinator_unreachable"}
+                return "rednet_message",1,p,"turtle_quarry_v1"
             end
             local all=table.concat(lines,"\n")
-            assert(all:find("WAITING TURTLE") and all:find("up blocked by",1,true),all)
+            assert(all:find("Swarm: pit-01 | #7 | 100,70,200",1,true)
+                and all:find("coordinator_unreachable",1,true),all)
             error("TEST_END")
         end
     ''')

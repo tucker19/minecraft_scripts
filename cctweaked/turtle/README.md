@@ -4,6 +4,8 @@
 
 `turtle_wireless_dash.lua` shows every quarry turtle broadcasting on `turtle_quarry_v1`. You don't configure a turtle ID.
 
+For multiple turtles working from one dynamic patch queue, see [Opt-in swarm setup](#opt-in-swarm-setup). Swarm is a separate program and does not replace a saved standalone job.
+
 The turtle saves an active job to its own filesystem. It stops when its chunk unloads and can continue the same job when the chunk loads and the computer boots. A chunk loader is not required. An interrupted action whose outcome cannot be established safely pauses for verification instead of risking a wrong move.
 
 ## Base placement and configuration
@@ -256,6 +258,58 @@ The migration checks the adjacent output capability and writes a new checkpoint 
 A pre-persistence quarry has no checkpoint, and this version cannot infer its original home or exact next action. Let it finish on the old script if you can. Otherwise stop it, recover the turtle and cargo manually, and put the turtle back at the original base cell and facing before upgrading. Check the storage-side settings in the new version.
 
 If a legacy `/chunk_dig` already exists, after stopping the old job you can save it as `move /chunk_dig /chunk_dig_legacy` before using the download command. Then either start an explicitly new job from the original base (it will rescan the footprint, including existing air), or use a different known base. Enable auto-resume for the new version only. Don't use `resume` or `resolve` as a migration step.
+
+## Opt-in swarm setup
+
+Use two roles: one dashboard computer runs `swarm_coordinator.lua`; each mining turtle runs `chunk_dig_swarm.lua`. Use a wireless or Ender modem on each. Swarm workers also need working GPS in the configured dimension. Try a disposable small footprint first: these programs have been exercised against simulated CC APIs, not a live server. The protocol is for a trusted Rednet network only; an ID allowlist is not authentication ([CC:Tweaked Rednet documentation](https://tweaked.cc/module/rednet.html)).
+
+### Dashboard computer
+
+Run each download on its own line:
+
+```text
+wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/swarm_coordinator.lua /swarm_coordinator.lua
+wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/swarm_patch_queue.lua /swarm_patch_queue.lua
+wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/swarm_common.lua /swarm_common.lua
+```
+
+Save `/swarm_coordinator.json` using your real coordinates. The example has two pre-cleared staging positions, two allowed turtle IDs, and six work cells. The inclusive `workBox` must not contain staging, approaches, inventories, or modems. Use `"work":["x,y,z",...]` instead for an irregular area. `clearApproach` contains verified air only, and must include every staging position. A box can contain at most 65,536 cells, but the filesystem may impose a lower practical limit: leave room for two complete ledger snapshots plus one staged write. Start small and check disk space before expanding.
+
+```json
+{"quarryId":"pit-01","manifestId":"pit-01-v1","dimension":"overworld","staging":["100,72,200","101,72,200"],"clearApproach":["100,72,200","101,72,200"],"workBox":{"min":"100,69,200","max":"101,71,200"},"patchSize":4,"margin":8,"workers":{"12":"100,72,200","18":"101,72,200"}}
+```
+
+To look up the dashboard or worker computer ID, run `id` on that computer. Initialize once, then run:
+
+```text
+swarm_coordinator init
+swarm_coordinator run
+```
+
+On a restart use `swarm_coordinator run`, never `init`. Use separate tabs or a `parallel` launcher if running the coordinator and `turtle_wireless_dash` on the same computer. Both can share the modem; their protocols differ. The optional updated dashboard shows swarm ID, assignment, patch, and waiting reason while preserving the normal standalone display.
+
+### Each turtle
+
+```text
+wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/chunk_dig_swarm.lua /chunk_dig_swarm.lua
+wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/swarm_common.lua /swarm_common.lua
+```
+
+Save `/chunk_dig_swarm.json`. Set `coordinator` to the dashboard computer ID and use the same quarry, manifest, and dimension as the coordinator. Use a unique staging position that exists in the coordinator config. Put the turtle there, facing the declared compass direction. Load coal, charcoal or coal blocks into the turtle before starting. Optional `output` (`"top"` or `"front"` relative to staging facing) unloads non-fuel items into an adjacent inventory. Unlike standalone, this version does not pull fuel from base storage; add fuel to the stopped turtle at staging. Without `output`, empty cargo manually at staging.
+
+```json
+{"quarryId":"pit-01","manifestId":"pit-01-v1","dimension":"overworld","coordinator":42,"staging":"100,72,200","facing":"north","output":"top"}
+```
+
+```text
+chunk_dig_swarm start
+chunk_dig_swarm status
+chunk_dig_swarm resume
+```
+
+Run `start` once. To run `status` or `resume` after use, first stop the worker with Ctrl+T and wait for movement to settle. Use `resume` after reboot or an ordinary stop; it will not create a new assignment over uncertain state. For an interrupted turn, use `status` and manually verify the actual facing before running `chunk_dig_swarm resolve before` or `chunk_dig_swarm resolve after`. Do not move the turtle, delete the ledger, or change active worker IDs/config to bypass recovery. Independent world/filesystem rollback is not automatically recoverable.
+
+Late turtles can start at vacant staging cells while others mine. On a trusted private network, set `"allowAnyWorker":true` to accept late IDs at known staging cells without editing the allowlist. Otherwise add new IDs to the coordinator config and restart `run` without reinitializing storage. Missing heartbeats never release work. Workers with no safe patch wait at staging; the mode currently requires enough configured staging space, does not split active patches, and does not move foreign turtles or open a blocked transit route. It skips cleared work but still inspects every transit step. No chunk loaders are required. The worker and coordinator do not change `/startup.lua`, and the worker refuses to open an existing standalone job.
 
 ## Testing
 
