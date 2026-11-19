@@ -11,8 +11,8 @@ except ImportError:
 HARNESS = r'''
 local clock, jobs, inbox, files, dirs, robots, world, packets = 0, {}, {}, {}, {}, {}, {}, {}
 local cuts, events = {}, {}
-local inventories,docks={},{}
-local cutPush,loseFinish,duplicateService
+local inventories,docks,hosts={},{},{}
+local cutPush,loseFinish,duplicateService,loseKind
 local COORD=99
 local function key(x,y,z) return x..","..y..","..z end
 local function clone(x)
@@ -48,7 +48,10 @@ local function env(id,program)
         exists=function(p) return f[p]~=nil or d[p]~=nil end,
         isDir=function(p) return d[p]~=nil end,
         makeDir=function(p) d[p]=true end,
-        delete=function(p) f[p]=nil end,
+        delete=function(p)
+            f[p],d[p]=nil,nil
+            for a in pairs(f) do if a:sub(1,#p+1)==p.."/" then f[a]=nil end end
+        end,
         move=function(a,b) assert(f[a] and not f[b]); f[b],f[a]=f[a],nil end,
         list=function(p)
             local t={}
@@ -72,7 +75,12 @@ local function env(id,program)
     e.peripheral={find=function() return {isWireless=function() return true end} end,
         getName=function() return "right" end,
         hasType=function(side,kind)
-            return r and kind=="inventory" and inventories[target(r,side=="top" and "Up" or "")]~=nil
+            if not r or kind~="inventory" then return false end
+            if side=="back" then
+                local d=v[(r.h+2)%4]
+                return inventories[key(r.x+d[1],r.y,r.z+d[2])]~=nil
+            end
+            return inventories[target(r,side=="top" and "Up" or "")]~=nil
         end,
         wrap=function(side)
             local dock=r and side=="top" and docks[target(r,"Up")]
@@ -86,7 +94,7 @@ local function env(id,program)
                     return {"list","getItemDetail","pushItems"}
                 end,
                 callRemote=function(name,method,a,from,n,into)
-                    assert(name=="shared_storage" and inventories[target(r,"")]==dock.storage)
+                    assert(name=="shared_storage")
                     local inv=dock.storage
                     if method=="list" then return clone(inv.items) end
                     if method=="getItemDetail" then return clone(inv.items[a]) end
@@ -107,9 +115,22 @@ local function env(id,program)
         end}
     e.rednet={
         open=function() end,
+        host=function(protocol,name) hosts[#hosts+1]={id=id,protocol=protocol,name=name} end,
+        lookup=function(protocol)
+            local found,seen={},{}
+            for _,h in ipairs(hosts) do
+                if h.protocol==protocol and jobs[h.id] and not seen[h.id] then
+                    seen[h.id]=true; found[#found+1]=h.id
+                end
+            end
+            return table.unpack(found)
+        end,
         send=function(dest,msg,protocol)
             if loseFinish==dest and msg.kind=="finish" and id==COORD then
                 loseFinish=nil; return true
+            end
+            if loseKind and msg.kind==loseKind and id==COORD then
+                loseKind=nil; return true
             end
             local pending=inbox[dest]
             pending[#pending+1]={sender=id,msg=clone(msg),protocol=protocol}
@@ -208,8 +229,8 @@ local function launch(id,program,...)
     local co=coroutine.create(fn)
     jobs[id]={co=co,args={...},wake=clock}
 end
-local function drive(untilFn)
-    for _=1,30000 do
+local function drive(untilFn,limit)
+    for _=1,limit or 30000 do
         if untilFn() then return end
         local id,nextJob
         for a,j in pairs(jobs) do
@@ -460,6 +481,162 @@ function station_stops_on_unexpected_delivery()
     assert(at(bay) and slot and robots[1].items[slot].name=="minecraft:granite" and queue().active[1].station)
     assert(out.taken==1 and robots[1].fuel<150 and stock(out,"minecraft:granite")==0)
 end
+
+-- Zero-config fixture: bay 0,0,0; the first turtle faces north, so the quarry
+-- is x=0..15, z=-15..0 below the bay. Barrel behind (south), wired dock above.
+local BAY,BARREL,DOCK="0,0,0","0,0,1","0,1,0"
+local function autoFixture(bottom)
+    files[COORD],dirs[COORD],inbox[COORD]={},{},{}
+    launch(COORD,coordinator)
+    drive(function() return #hosts>0 end)
+    world[BARREL],world[DOCK]="minecraft:barrel","computercraft:wired_modem_full"
+    inventories[BARREL]={items={[1]={name="minecraft:coal_block",count=64}}}
+    docks[DOCK]={online=true,storage=inventories[BARREL]}
+    for x=0,15 do for z=-15,0 do for y=bottom,-1 do world[key(x,y,z)]="minecraft:stone" end end end
+end
+local function place(id,h,fuel)
+    assert(not at(BAY),"bay occupied")
+    robots[id]={x=0,y=0,z=0,h=h,fuel=fuel,digs=0,moves=0,turns=0,items={},slot=1}
+    files[id],dirs[id],inbox[id]={},{},{}
+end
+local function noConfigFiles()
+    for id,f in pairs(files) do
+        for p in pairs(f) do assert(not p:find("%.json$"),"config file "..p.." on "..id) end
+    end
+end
+local function staged()
+    local n=0
+    for _ in pairs(queue().staging) do n=n+1 end
+    return n
+end
+local function bayFree()
+    if at(BAY) then return false end
+    for _,g in pairs(queue().active) do for _,p in ipairs(g.route) do if p==BAY then return false end end end
+    return true
+end
+local function parkedAt(id,p)
+    local snap=snapshot(id)
+    return snap and not dirs[id]["/.chunk_dig_swarm_setup"] and not snap.grant
+        and key(robots[id].x,robots[id].y,robots[id].z)==p and snap.stage==p
+end
+local function joinWhenFree(id,h)
+    drive(function() return bayFree() and staged()>=id end,60000)
+    place(id,h,0)
+    launch(id,worker)
+end
+
+function auto_define_join_and_finish_layer()
+    autoFixture(-1)
+    place(1,0,0)
+    launch(1,worker,"new","1","-1")
+    drive(function() return snapshot(1) and staged()>=3 end,60000)
+    local q=queue()
+    assert(q.auto.definer==1 and q.auto.heading==0 and q.station.facing=="south")
+    assert(q.box.x0==0 and q.box.x1==15 and q.box.z0==-15 and q.box.z1==0 and q.box.y0==-1)
+    assert(q.parked[1]=="0,-1,-1" and inventories[BARREL].taken>=1)
+    assert(not dirs[1]["/.chunk_dig_swarm_setup"])
+    assert(files[1]["/startup.lua"]:find('shell.execute("/chunk_dig_swarm","auto")',1,true))
+    -- Probe moved straight down and forward without turning.
+    local first={}
+    for _,e in ipairs(events) do if e.id==1 and e.op=="move" then first[#first+1]=e.p end end
+    assert(first[1]=="0,-1,0" and first[2]=="0,-1,-1")
+    -- Turtle 2 is placed facing east, with no fuel; it finds the barrel itself.
+    joinWhenFree(2,1)
+    drive(function() return parkedAt(2,"1,-1,-1") end,60000)
+    assert(robots[2].h==0 and queue().parked[2]=="1,-1,-1")
+    -- Turtle 3 faces west.
+    joinWhenFree(3,3)
+    drive(function() return parkedAt(3,"2,-1,-1") end,60000)
+    drive(function()
+        local s=queue()
+        return s.layers[-1]=="c" and next(s.active)==nil
+    end,400000)
+    for x=0,15 do for z=-15,0 do assert(not world[key(x,-1,z)],"left stone at "..key(x,-1,z)) end end
+    local dug={}
+    for _,e in ipairs(events) do
+        if e.op=="dig" then assert(not dug[e.p],"dug twice "..e.p); dug[e.p]=true end
+    end
+    for id=1,3 do assert(robots[id].y==-1 and robots[id].z==-1,"turtle "..id.." not parked") end
+    noConfigFiles()
+end
+
+function auto_define_survives_reboot_and_lost_reply()
+    autoFixture(-2)
+    place(1,0,500)
+    files[1]["/startup.lua"]='shell.execute("/chunk_dig", "auto")\n'
+    cuts[1]="0,-1,0"
+    launch(1,worker,"new","1","-2")
+    drive(function() return jobs[1].cut end)
+    assert(dirs[1]["/.chunk_dig_swarm_setup"] and not dirs[1]["/.chunk_dig_swarm"] and not queue())
+    -- Power returns: coordinator restarts first, the define reply is lost once.
+    launch(COORD,coordinator)
+    loseKind="define"
+    inbox[1]={}
+    launch(1,worker,"auto")
+    drive(function() return snapshot(1) and not dirs[1]["/.chunk_dig_swarm_setup"] end)
+    assert(loseKind==nil and queue().auto.definer==1 and queue().parked[1]=="0,-1,-1")
+    assert(robots[1].moves==2 and robots[1].turns==0)
+    -- Existing startup logic is kept, and the hook is appended once.
+    local start=files[1]["/startup.lua"]
+    assert(start:sub(1,36)=='shell.execute("/chunk_dig", "auto")\n',start)
+    assert(files[1]["/startup.lua.before_swarm"]=='shell.execute("/chunk_dig", "auto")\n')
+    -- Running "new" again cannot start a second quarry or redefine home.
+    jobs[1]=nil
+    launch(1,worker,"new","1","-2")
+    local ok,why=pcall(drive,function() return jobs[1]==nil end)
+    assert(not ok and tostring(why):find("Saved swarm state exists",1,true),tostring(why))
+    noConfigFiles()
+end
+
+function auto_join_recovers_mid_route()
+    autoFixture(-1)
+    place(1,0,0)
+    launch(1,worker,"new","1","-1")
+    drive(function() return snapshot(1) and staged()>=2 end,60000)
+    drive(function() return bayFree() end,60000)
+    place(2,2,0)
+    cuts[2]="1,-1,0" -- second lane cell, after servicing in the bay
+    launch(2,worker)
+    drive(function() return jobs[2].cut end,60000)
+    local snap=snapshot(2)
+    assert(snap.grant.relocate and snap.stationComplete and snap.stage=="1,-1,-1")
+    local taken=inventories[BARREL].taken
+    jobs[COORD],inbox[COORD]=nil,{}
+    inbox[2]={}
+    launch(2,worker,"auto")
+    local start=clock
+    drive(function() return clock>start+10 end)
+    -- Without the coordinator it cannot verify the grant, so it holds still.
+    assert(robots[2].x==1 and robots[2].z==0 and queue().active[2])
+    launch(COORD,coordinator)
+    drive(function() return parkedAt(2,"1,-1,-1") end,60000)
+    assert(inventories[BARREL].taken>=taken and robots[2].h==0 and robots[2].fuel>=900)
+end
+
+function coordinator_startup_hook_preserves_existing_startup()
+    multishell={}
+    files[COORD],dirs[COORD],inbox[COORD]={["/startup.lua"]='shell.run("turtle_wireless_dash")\n'},{},{}
+    launch(COORD,coordinator)
+    drive(function() return #hosts>0 end)
+    multishell=nil
+    local start=files[COORD]["/startup.lua"]
+    assert(start=='if multishell then shell.openTab("/swarm_coordinator") end\nshell.run("turtle_wireless_dash")\n',start)
+    assert(files[COORD]["/startup.lua.before_swarm"]=='shell.run("turtle_wireless_dash")\n')
+    launch(COORD,coordinator)
+    multishell={}
+    drive(function() return #hosts>1 end)
+    multishell=nil
+    assert(files[COORD]["/startup.lua"]==start,"hook added twice")
+end
+
+function auto_join_before_define_is_refused()
+    autoFixture(-1)
+    place(5,1,0)
+    launch(5,worker)
+    local ok,why=pcall(drive,function() return jobs[5]==nil end)
+    assert(not ok and tostring(why):find("No quarry defined yet",1,true),tostring(why))
+    assert(not dirs[5]["/.chunk_dig_swarm_setup"] and not dirs[5]["/.chunk_dig_swarm"] and robots[5].moves==0)
+end
 '''
 
 
@@ -509,6 +686,21 @@ class SwarmRuntimeTests(unittest.TestCase):
 
     def test_shared_station_stops_on_unexpected_fuel_delivery(self):
         self.lua.globals().station_stops_on_unexpected_delivery()
+
+    def test_zero_config_define_join_and_finish_layer(self):
+        self.lua.globals().auto_define_join_and_finish_layer()
+
+    def test_zero_config_define_survives_reboot_and_lost_reply(self):
+        self.lua.globals().auto_define_survives_reboot_and_lost_reply()
+
+    def test_zero_config_join_recovers_mid_route(self):
+        self.lua.globals().auto_join_recovers_mid_route()
+
+    def test_coordinator_startup_hook_preserves_existing_startup(self):
+        self.lua.globals().coordinator_startup_hook_preserves_existing_startup()
+
+    def test_zero_config_join_before_define_is_refused(self):
+        self.lua.globals().auto_join_before_define_is_refused()
 
 
 if __name__ == "__main__":

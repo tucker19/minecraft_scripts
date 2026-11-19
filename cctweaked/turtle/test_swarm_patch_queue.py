@@ -50,6 +50,53 @@ class PatchQueueTests(unittest.TestCase):
             end
         """)
 
+    def test_automatic_layout_promotes_parking_and_gates_joins(self):
+        self.lua.execute("""
+            -- First turtle in bay 0,70,0 probed north; 1 chunk down to y=-64.
+            local s=Queue.define{worker=7,bay="0,70,0",park="0,69,-1",heading=0,chunks=1,bottom=-64,
+                quarryId="q",manifestId="m",dimension="auto"}
+            assert(s.box.x0==0 and s.box.x1==15 and s.box.z0==-15 and s.box.z1==0)
+            assert(s.box.y0==-64 and s.box.y1==69 and s.station.facing=="south")
+            assert(s.staging["0,69,-1"] and s.parked[7]=="0,69,-1" and s.clearApproach["0,69,0"])
+            local route=s.station.routes["0,69,-1"]
+            assert(#route==3 and route[2]=="0,69,0" and route[3]=="0,70,0")
+            -- 134 layers x 256 cells are stored as one character per uniform layer.
+            assert(commit(s))
+            assert(#read_commit()<20000,"compact ledger is "..#read_commit().." bytes")
+            local q=reopen()
+            -- Newcomer before any extra parking exists: refused with no change.
+            assert(q:join(8,"0,70,0",0).reason=="no_parking")
+            assert(q:join(8,"5,70,5",0)==nil)
+            -- The first claim digs the lane and parking rows before anything else.
+            local r=claim(q,7,2,"0,69,-1",5000)
+            for _,p in ipairs(r.grant.cells) do assert(q.state.auto.infra[p],p.." is not lane/parking") end
+            local evidence={}
+            for _,p in ipairs(r.grant.cells) do evidence[p]="clear" end
+            assert(q:finish(7,3,"0,69,-1",r.grant.id,evidence))
+            q=reopen()
+            assert(q.state.staging["1,69,-1"] and q.state.clearApproach["1,69,0"])
+            assert(#q.state.layers[69]==256 and #q.state.layers[68]==1)
+            -- A service grant holds the bay, so a newcomer is told to wait.
+            assert(q:service(7,4,"0,69,-1",5000).grant)
+            assert(q:join(8,"0,70,0",0).reason=="bay_busy")
+            assert(q:finish(7,5,"0,69,-1",q.state.active[7].id,{}))
+            local j=q:join(8,"0,70,0","unlimited")
+            local g=j.grant
+            assert(g.relocate and j.stage=="1,69,-1" and j.seq==1 and #g.route==4)
+            assert(g.route[1]=="0,70,0" and g.route[2]=="0,69,0" and g.route[3]=="1,69,0" and g.route[4]=="1,69,-1")
+            -- Duplicate join (lost reply) returns the same grant; others wait.
+            local again=q:join(8,"0,70,0","unlimited")
+            assert(again.grant.id==g.id and again.seq==1)
+            assert(q:join(9,"0,70,0",0).reason=="bay_busy")
+            q=reopen()
+            assert(q:finish(8,2,"1,69,-1",g.id,{}))
+            assert(not q.state.active[8] and q.state.parked[8]=="1,69,-1")
+            -- Mining routes never use the service lane.
+            local m=claim(q,8,3,"1,69,-1",5000)
+            for _,p in ipairs(m.grant.route) do assert(q.state.auto.infra[p]~="lane" or p==m.grant.route[1]) end
+        """)
+
+
     def test_six_joins_in_same_chunk_without_overlapping_work_or_routes(self):
         self.lua.execute("""
             local staging,work={},{}

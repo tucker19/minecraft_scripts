@@ -261,11 +261,21 @@ If a legacy `/chunk_dig` already exists, after stopping the old job you can save
 
 ## Opt-in swarm setup
 
-Use two roles: one dashboard computer runs `swarm_coordinator.lua`; each mining turtle runs `chunk_dig_swarm.lua`. Use a wireless or Ender modem on each. Swarm workers also need working GPS in the configured dimension. Try a disposable small footprint first: these programs have been exercised against simulated CC APIs, not a live server. The protocol is for a trusted Rednet network only; an ID allowlist is not authentication ([CC:Tweaked Rednet documentation](https://tweaked.cc/module/rednet.html)).
+Run as many mining turtles as you like in one quarry. There are no config or JSON files: you build the bay, start the coordinator, and tell the first turtle how many chunks to dig. The programs work out the rest. These programs have been exercised against simulated CC APIs, not a live server, so try a disposable one-chunk quarry first. The protocol is for a trusted Rednet network only; Rednet does not authenticate senders ([CC:Tweaked Rednet documentation](https://tweaked.cc/module/rednet.html)).
 
-### Dashboard computer
+### What you build
 
-Run each download on its own line:
+The bay is the same layout as the standalone [shared storage and wired fuel dock](#shared-storage-and-wired-fuel-dock). Pick the cell where the first turtle will sit (the bay), facing the direction the quarry should extend:
+
+1. Put **one shared barrel** directly behind the bay and stock it with coal blocks. All mined cargo goes into it too.
+2. Put a **Wired Modem (Full Block)** directly above the bay and another directly above the barrel. Put a stationary CC peripheral (a plain computer works) above the bay modem as a keepalive. Activate peripheral mode on both modems. The barrel must be the only inventory on that wired network, and the only inventory beside the bay.
+3. Give the **dashboard computer** and **every turtle** a wireless or Ender modem. A working GPS constellation is required.
+
+Nothing else is placed or pre-dug. The quarry covers the same footprint as `chunk_dig.lua`: forward and to the right of the bay, starting one block below it. The first row under the bay becomes the swarm's service lane, and the next row becomes parking spots. The turtles dig both rows first.
+
+### Load the scripts
+
+On the dashboard computer, run each line:
 
 ```text
 wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/swarm_coordinator.lua /swarm_coordinator.lua
@@ -273,65 +283,38 @@ wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked
 wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/swarm_common.lua /swarm_common.lua
 ```
 
-Save `/swarm_coordinator.json` using your real coordinates. The example has two pre-cleared staging positions, two allowed turtle IDs, and six work cells. The inclusive `workBox` must not contain staging, approaches, inventories, or modems. Use `"work":["x,y,z",...]` instead for an irregular area. `clearApproach` contains verified air only, and must include every staging position. A box can contain at most 65,536 cells, but the filesystem may impose a lower practical limit: leave room for two complete ledger snapshots plus one staged write. Start small and check disk space before expanding.
-
-```json
-{"quarryId":"pit-01","manifestId":"pit-01-v1","dimension":"overworld","staging":["100,72,200","101,72,200"],"clearApproach":["100,72,200","101,72,200"],"workBox":{"min":"100,69,200","max":"101,71,200"},"patchSize":4,"margin":8,"workers":{"12":"100,72,200","18":"101,72,200"}}
-```
-
-To look up the dashboard or worker computer ID, run `id` on that computer. Initialize once, then run:
-
-```text
-swarm_coordinator init
-swarm_coordinator run
-```
-
-On a restart use `swarm_coordinator run`, never `init`. Use separate tabs or a `parallel` launcher if running the coordinator and `turtle_wireless_dash` on the same computer. Both can share the modem; their protocols differ. The optional updated dashboard shows swarm ID, assignment, patch, and waiting reason while preserving the normal standalone display.
-
-### Each turtle
+On every turtle:
 
 ```text
 wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/chunk_dig_swarm.lua /chunk_dig_swarm.lua
 wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked/turtle/swarm_common.lua /swarm_common.lua
 ```
 
-Save `/chunk_dig_swarm.json`. Set `coordinator` to the dashboard computer ID and use the same quarry, manifest, and dimension as the coordinator. Use a unique staging position that exists in the coordinator config. Put the turtle there, facing the declared compass direction. Load coal, charcoal or coal blocks into the turtle before starting. Without a shared station, the turtle burns carried fuel only and optional `output` (`"top"` or `"front"` relative to staging facing) unloads non-fuel items into an adjacent inventory. With neither option, empty cargo manually at staging.
+### Kick it off
 
-```json
-{"quarryId":"pit-01","manifestId":"pit-01-v1","dimension":"overworld","coordinator":42,"staging":"100,72,200","facing":"north","output":"top"}
-```
+1. Dashboard computer: `swarm_coordinator`. It waits for the first turtle. To keep the dashboard on the same computer, run `bg swarm_coordinator` and then start `turtle_wireless_dash` as usual.
+2. First turtle, in the bay facing the quarry: `chunk_dig_swarm new 1`. The number is the chunk count (1 to 8). An optional second number sets the bottom Y (default `-64`), for example `chunk_dig_swarm new 2 10`.
+3. Every later turtle: place it in the bay, in any facing and with no fuel, and run `chunk_dig_swarm`. It finds the barrel by turning in place, unloads and refuels from the barrel, drives the lane to the next free parking spot, and starts mining. Add one turtle at a time. If the bay is busy, or no parking spot has been dug yet, it says so and does nothing: lift it out and try again shortly.
 
-```text
-chunk_dig_swarm start
-chunk_dig_swarm status
-chunk_dig_swarm resume
-```
+What the first turtle does: it checks GPS, the barrel behind it, and the wired dock. If its fuel is under 100, it takes coal blocks from the barrel. It then digs and moves one block down and one block forward, without turning, so GPS reveals its facing. It reports the bay, facing, and chunk count to the coordinator, which builds the quarry ledger. That second cell becomes its parking spot. The turtle never treats a later position as a new home.
 
-Run `start` once. To run `status` or `resume` after use, first stop the worker with Ctrl+T and wait for movement to settle. Use `resume` after reboot or an ordinary stop; it will not create a new assignment over uncertain state. For an interrupted turn, use `status` and manually verify the actual facing before running `chunk_dig_swarm resolve before` or `chunk_dig_swarm resolve after`. Do not move the turtle, delete the ledger, or change active worker IDs/config to bypass recovery. Independent world/filesystem rollback is not automatically recoverable.
+### Reboots and chunk unloads
 
-Late turtles can start at vacant staging cells while others mine. On a trusted private network, set `"allowAnyWorker":true` to accept late IDs at known staging cells without editing the allowlist. Otherwise add new IDs to the coordinator config and restart `run` without reinitializing storage. Missing heartbeats never release work. Workers with no safe patch wait at staging; the mode currently requires enough configured staging space, does not split active patches, and does not move foreign turtles or open a blocked transit route. It skips cleared work but still inspects every transit step. No chunk loaders are required. The worker and coordinator do not change `/startup.lua`, and the worker refuses to open an existing standalone job.
+No chunk loaders are needed. When a turtle's chunk unloads, it simply stops. On first setup, each turtle appends `shell.execute("/chunk_dig_swarm","auto")` to the end of its existing `/startup.lua`, after any lines already there (for example `shell.execute("/chunk_dig", "auto")`), and saves the original as `/startup.lua.before_swarm`. If the turtle uses a `/startup/` folder instead, it adds `/startup/99_chunk_dig_swarm.lua`. `auto` resumes saved swarm work or unfinished setup, and does nothing on a turtle with neither. On an advanced computer, the coordinator puts `if multishell then shell.openTab("/swarm_coordinator") end` at the top of `/startup.lua`, with the same backup, so the dashboard program below it still runs. On a basic computer it prints a reminder to add `swarm_coordinator` to startup yourself.
 
-### Shared unload and refuel station
+Recovery is GPS-based. An interrupted setup repeats from GPS: the probe only ever moves down and then forward, and a newcomer re-finds the barrel by turning. A pending move resolves by comparing GPS with both saved positions. An interrupted turn during mining cannot be resolved by GPS, so the turtle stops. Check its facing, then run `chunk_dig_swarm resolve before` or `resolve after`. `chunk_dig_swarm status` shows saved state. Missing heartbeats, reboots, and coordinator restarts never release a reservation. A worker that cannot reach the coordinator after a reboot holds still until it can. Independent world or filesystem rollback is not automatically recoverable.
 
-Everyone keeps a private staging spot but shares one service bay. The bay uses the same [shared storage and wired fuel dock](#shared-storage-and-wired-fuel-dock) pattern as `chunk_dig.lua`:
+### Running notes
 
-1. Put **one shared barrel or other inventory** directly in front of the bay's configured facing. Stock it with coal blocks. This same inventory receives all mined cargo; coal blocks and cargo can share it. Any storage exposing the required capabilities works in principle, so check that your chosen face exposes the CC:Tweaked `inventory` type and accepts cargo.
-2. Put a **Wired Modem (Full Block)** directly above the bay and another immediately above the shared inventory. Activate peripheral mode on both. Put a stationary CC peripheral (a computer will do) above the bay modem so it stays enabled when the turtle leaves. On this network the shared barrel must be the only remote inventory; station fuel needs `list` and slot-specific `pushItems` to the visiting turtle. The turtles still use wireless or Ender modems for coordination and GPS.
-3. Pre-clear every route one block per step. Keep the shared storage, both modems, and keepalive out of `workBox` and `clearApproach`, and don't replace the fixtures or sort or modify the inventory with other automation while servicing. A slot read and transfer are not atomic; a mismatched delivery stops the turtle and retains its reservation.
+- Each turtle keeps its own parking spot as home and uses the bay one at a time, the same way standalone does. At the bay it burns carried coal blocks, unloads cargo, and pulls single coal blocks through the wired dock. It visits the bay when it has cargo, when fuel is below 800, or when a reachable patch needs more fuel.
+- Parking is limited to the dug parking row: 16 spots per chunk width, up to 64.
+- When nothing reachable remains, turtles wait at parking with `no_safe_patch`. Bedrock and protected Allthemodium ores stay blocked, and cells that cannot be entered are reported as blocked or unverified, never as cleared.
+- The dashboard shows the swarm job, assigned area (including `moving to parking`), and waiting reason alongside normal telemetry.
+- Do not change the bay layout or start another coordinator during a quarry. To start a new quarry, let all turtles park, stop everything, delete `/.chunk_dig_swarm_coordinator` on the dashboard computer and `/.chunk_dig_swarm` on each turtle, then repeat the kick-off steps. The swarm never opens a standalone `/.chunk_dig` job.
 
-For the two-staging example above, use this full coordinator config. The bay is `100,72,201` facing south, the shared barrel is at `100,72,202`, the bay modem is `100,73,201`, the barrel modem is `100,73,202`, and the keepalive is `100,74,201`. The second turtle approaches through `101,72,201`, not through the first turtle's staging block.
+### Advanced: manual manifests
 
-```json
-{"quarryId":"pit-01","manifestId":"pit-01-v1","dimension":"overworld","staging":["100,72,200","101,72,200"],"clearApproach":["100,72,200","101,72,200","101,72,201","100,72,201"],"workBox":{"min":"100,69,200","max":"101,71,200"},"patchSize":4,"margin":8,"workers":{"12":"100,72,200","18":"101,72,200"},"station":{"bay":"100,72,201","facing":"south","fuelTarget":1600,"routes":{"100,72,200":["100,72,200","100,72,201"],"101,72,200":["101,72,200","101,72,201","100,72,201"]}}}
-```
-
-On each turtle, remove `output` and set `"sharedStation":true`. The optional `serviceBelow` is the fuel threshold at staging (default `800`). The worker also requests a visit when it has cargo or when a reachable patch needs more fuel. At the bay, it burns carried coal blocks first, then other carried fuel if needed, unloads all remaining items, and selectively takes coal blocks from the same barrel. If unloading is blocked, it can take and burn a coal block first to free storage space when its tank can accept it. `fuelTarget` is the desired fuel on return to staging, limited by the turtle's fuel capacity minus the return trip; use a target high enough for useful mining and the station's round trip. A turtle needs at least twice the route length in moves plus `margin` to leave staging for the bay; give it starter fuel before launching it. The station won't send a rescue to an empty turtle.
-
-For a new swarm, use `swarm_coordinator init` with this config and then `swarm_coordinator run`. To enable on an existing swarm, stop all workers at their own staging spots with no active assignments, stop the coordinator, update `swarm_coordinator.lua`, `swarm_patch_queue.lua`, and all worker scripts, then save the config with the station. Run `swarm_coordinator enable-station`, then `swarm_coordinator run`. Resume each saved worker with `chunk_dig_swarm resume`; do not run `init` or `start` again. The station geometry is persisted, not hot-reloaded. A busy worker can keep mining if it already has a separate reservation; a worker waiting for the bay stays at staging.
-
-If you already enabled the earlier two-container station, let its visiting turtle return to staging before changing hardware. Stop the workers and, with the bay idle, remove the overhead fuel barrel, install the wired dock and stock the front barrel with coal blocks. Confirm the new fixture spaces were never designated as approach or work cells. Update all worker scripts and run `chunk_dig_swarm resume`; there is no ledger, coordinator, or startup migration for the same bay and routes.
-
-If the barrel cannot accept cargo, the modem is absent or ambiguous, no coal blocks are extractable, or the route is obstructed, fix the reported condition without moving the turtle. The owner holds the bay and its route until returning to its own GPS-verified staging spot. Neither a worker unload/reboot nor a coordinator restart gives another turtle permission to enter. To resume automatically after ordinary reloads on a dedicated swarm turtle, add `if fs.exists("/.chunk_dig_swarm") then shell.execute("/chunk_dig_swarm", "resume") end` to its existing startup logic rather than replacing that logic. An interrupted turn still needs manual facing verification, and independent world/filesystem rollback is not automatically recoverable.
+Existing hand-written ledgers still run. `swarm_coordinator init|run|enable-station [config.json]` and `chunk_dig_swarm start` with `/chunk_dig_swarm.json` behave as before. A turtle with `/chunk_dig_swarm.json` refuses automatic setup, so remove that file on turtles joining an automatic quarry. New quarries do not need either file.
 
 ## Testing
 
@@ -343,6 +326,8 @@ python3 cctweaked/turtle/test_quarry.py
 ```
 
 The harness checks the existing quarry behavior and abandons the Lua coroutine around moves, turns, digs, transfers, checkpoint publication and phase changes. Collision tests simulate spare turtles in front, above, and below, including a second wait cycle, a turtle that arrives just before a dig or during a failed move, and reboot during home travel. Shared-inventory tests cover entry and reboot from all four headings, masked peripherals, sorting and virtual coal, and interrupted migration. Archive and new-job tests cover whole-directory preservation, numbering, invalid arguments and preflight failures, failed moves and fresh startup failures, and boot after archiving. These are simulated, not actual modded storage, block placement, or chunk unload/reload tests.
+
+`python3 -m unittest discover -s cctweaked/turtle -p "test_swarm*.py"` runs the swarm suites. The runtime suite runs the real coordinator and worker programs against simulated turtles, GPS, Rednet, wired dock, and filesystem. It covers a zero-config quarry where three turtles define, join, and clear a one-layer chunk, plus a reboot during the first turtle's probe with a lost define reply and a coordinator restart. It also covers a newcomer losing power mid-lane, startup-hook preservation, bay contention, and the earlier collision and station cases. A simulated "cut" stops the program at a chosen move and restarts it from saved files, which models an unload but is not an in-game unload/reload test.
 
 To check your installed build, put a spare turtle in front of a stopped turtle and run `lua`, then `local ok,b=turtle.inspect(); print(ok,textutils.serialize(b))`. Repeat with both turtle types; the result reports the block ID and any inspectable tags. For an in-game collision smoke test, use a disposable quarry and place a spare turtle in the next front/up/down cell before resuming. Leave one through two checks and remove another during a pause. Check that the display stays on `WAITING TURTLE` until the next recheck, then the quarry continues without relocating the mining turtle.
 

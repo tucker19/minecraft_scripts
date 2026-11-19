@@ -1,41 +1,77 @@
--- chunk_dig_swarm start|resume|status|resolve [before|after]
--- Configuration is /chunk_dig_swarm.json. Never opens standalone state.
-local mode,choice=...
+-- First turtle, sitting in the bay facing the quarry:  chunk_dig_swarm new <chunks> [bottomY]
+-- Every later turtle, placed in the same bay:          chunk_dig_swarm
+-- Recovery and inspection:                             chunk_dig_swarm resume|status|resolve before|after
+-- Startup hook (added automatically):                  chunk_dig_swarm auto
+-- Advanced manual manifest: chunk_dig_swarm start with /chunk_dig_swarm.json.
+-- Never opens standalone state.
+local mode,choice,extra=...
 assert(turtle,"Run chunk_dig_swarm on a mining turtle")
-assert(mode=="start" or mode=="resume" or mode=="status" or mode=="resolve",
-    "Usage: chunk_dig_swarm start|resume|status|resolve [before|after]")
+local usage="Usage: chunk_dig_swarm new <chunks> [bottomY] | join | resume | status | resolve before|after"
+assert(mode==nil or ({new=true,join=true,start=true,resume=true,status=true,resolve=true,auto=true})[mode],usage)
 assert(not fs.exists("/.chunk_dig"),"Standalone quarry save exists; swarm will not touch it")
 local M=assert(loadfile(fs.combine(fs.getDir(shell.getRunningProgram()),"swarm_common.lua")))()
-local c=M.config("/chunk_dig_swarm.json")
-M.xyz(c.staging)
+local DIR,SETUP,MANUAL="/.chunk_dig_swarm","/.chunk_dig_swarm_setup","/chunk_dig_swarm.json"
 local headings={north=0,east=1,south=2,west=3}
-local heading=headings[c.facing]
-local serviceBelow=c.serviceBelow or 800
-assert(heading and type(c.coordinator)=="number" and c.coordinator%1==0 and c.coordinator>=0
-    and type(c.quarryId)=="string" and type(c.manifestId)=="string" and type(c.dimension)=="string"
-    and (c.sharedStation==nil or type(c.sharedStation)=="boolean")
-    and type(serviceBelow)=="number" and serviceBelow%1==0 and serviceBelow>=0 and serviceBelow<=1000000
-    and not (c.sharedStation and c.output)
-    and (c.output==nil or c.output=="top" or c.output=="front"),"invalid swarm worker configuration")
 local me=os.getComputerID()
-local DIR="/.chunk_dig_swarm"
 local function locate()
     local x,y,z=gps.locate(2)
     if not x then return nil end
     return M.key(x,y,z)
 end
+if mode==nil or mode=="auto" then
+    -- An unfinished setup always wins: its main state (if any) was never used.
+    if fs.exists(SETUP) then mode="setup"
+    elseif fs.exists(DIR) then mode="resume"
+    elseif mode=="auto" then return
+    else mode="join" end
+elseif mode=="resume" and fs.exists(SETUP) then mode="setup" end
+if mode=="status" and fs.exists(SETUP) then
+    print("Swarm setup in progress; run chunk_dig_swarm to continue it")
+    return
+end
+local manual=fs.exists(MANUAL)
+local c,heading,serviceBelow
 local s,commit
-if mode=="start" then
-    if fs.exists(DIR) then error("Saved swarm state exists; run chunk_dig_swarm resume",0) end
-    assert(locate()==c.staging,"GPS does not match staging")
-    s,commit=M.store(DIR,true)
-    s={seq=0,boot=0,worker=me,stage=c.staging,stageHeading=heading,coordinator=c.coordinator,
-        quarryId=c.quarryId,manifestId=c.manifestId,dimension=c.dimension,heading=heading,trail={c.staging}}
-    commit(s)
-else s,commit=M.store(DIR) end
-assert(s.worker==me and s.stage==c.staging and s.stageHeading==heading and s.coordinator==c.coordinator
-    and s.quarryId==c.quarryId and s.manifestId==c.manifestId and s.dimension==c.dimension,
-    "worker config and saved state disagree; do not move")
+if manual then
+    assert(mode~="new" and mode~="join" and mode~="setup",
+        "Remove /chunk_dig_swarm.json to use automatic setup")
+    c=M.config(MANUAL)
+    M.xyz(c.staging)
+    heading=headings[c.facing]
+    serviceBelow=c.serviceBelow or 800
+    assert(heading and type(c.coordinator)=="number" and c.coordinator%1==0 and c.coordinator>=0
+        and type(c.quarryId)=="string" and type(c.manifestId)=="string" and type(c.dimension)=="string"
+        and (c.sharedStation==nil or type(c.sharedStation)=="boolean")
+        and type(serviceBelow)=="number" and serviceBelow%1==0 and serviceBelow>=0 and serviceBelow<=1000000
+        and not (c.sharedStation and c.output)
+        and (c.output==nil or c.output=="top" or c.output=="front"),"invalid swarm worker configuration")
+    if mode=="start" then
+        if fs.exists(DIR) then error("Saved swarm state exists; run chunk_dig_swarm resume",0) end
+        assert(locate()==c.staging,"GPS does not match staging")
+        s,commit=M.store(DIR,true)
+        s={seq=0,boot=0,worker=me,stage=c.staging,stageHeading=heading,coordinator=c.coordinator,
+            quarryId=c.quarryId,manifestId=c.manifestId,dimension=c.dimension,heading=heading,trail={c.staging}}
+        commit(s)
+    else s,commit=M.store(DIR) end
+    assert(not s.auto and s.worker==me and s.stage==c.staging and s.stageHeading==heading
+        and s.coordinator==c.coordinator and s.quarryId==c.quarryId and s.manifestId==c.manifestId
+        and s.dimension==c.dimension,"worker config and saved state disagree; do not move")
+else
+    assert(mode~="start",
+        "No /chunk_dig_swarm.json needed. First turtle: chunk_dig_swarm new <chunks>. Later turtles: chunk_dig_swarm")
+    serviceBelow=800
+    c={sharedStation=true}
+    if mode~="new" and mode~="join" and mode~="setup" then s,commit=M.store(DIR) end
+end
+-- Automatic workers carry their whole identity in saved state.
+local function useState()
+    assert(s.auto==true and s.worker==me and type(s.coordinator)=="number" and type(s.quarryId)=="string"
+        and type(s.manifestId)=="string" and type(s.dimension)=="string"
+        and type(s.stageHeading)=="number","invalid automatic swarm state")
+    c.quarryId,c.manifestId,c.dimension=s.quarryId,s.manifestId,s.dimension
+    c.coordinator,c.staging,heading=s.coordinator,s.stage,s.stageHeading
+end
+if s and not manual then useState() end
 local function pos() return s.trail[#s.trail] end
 if mode=="status" then
     print(("Swarm %s | assignment %s | saved %s heading %s"):format(
@@ -79,6 +115,7 @@ end
 local tokenCounter,lastSync,lastReport=0,-math.huge,-math.huge
 local state,detail,reason="starting","",""
 local function report(force)
+    if not (s and s.trail and heading) then return end -- setup has no swarm position yet
     local now=os.clock()
     if not force and now-lastReport<3 then return end
     lastReport=now
@@ -105,7 +142,8 @@ local function report(force)
         inventory={usedSlots=used,totalSlots=16,percent=used*100/16,items=items},
         location={relative={x=f,y=y-ay,z=r},heading=(s.heading-heading)%4},
         swarm={quarryId=s.quarryId,assignmentId=s.grant and s.grant.id,
-            area=s.grant and (s.grant.station and ("service bay "..s.grant.route[#s.grant.route])
+            area=s.grant and (s.grant.relocate and ("moving to parking "..s.stage)
+                or s.grant.station and ("service bay "..s.grant.route[#s.grant.route])
                 or (s.grant.cells[1].." +"..(#s.grant.cells-1).." cells")),
             waitingReason=reason}
     },M.telemetry)
@@ -141,8 +179,13 @@ end
 local function checkGrant(g)
     assert(type(g)=="table" and g.worker==me and type(g.id)=="number" and g.id>=1 and g.id%1==0
         and type(g.fuelNeed)=="number" and g.fuelNeed%1==0
-        and #g.route>=1 and #g.cells<=256 and g.route[1]==s.stage
-        and g.fuelNeed>=2*(#g.route-1+#g.cells),"invalid swarm grant")
+        and #g.route>=1 and #g.cells<=256
+        and (g.relocate and g.route[#g.route]==s.stage and g.fuelNeed==0
+            or not g.relocate and g.route[1]==s.stage and g.fuelNeed>=2*(#g.route-1+#g.cells)),
+        "invalid swarm grant")
+    if g.relocate then
+        assert(g.relocate==true and g.station and not manual,"invalid relocation grant")
+    end
     if g.station then
         assert(c.sharedStation and #g.route>1 and #g.cells==0 and not g.serviceReserve
             and headings[g.station.facing] and type(g.station.fuelTarget)=="number"
@@ -179,7 +222,7 @@ end
 local function sameGrant(a,b)
     checkGrant(b)
     if a.id~=b.id or a.fuelNeed~=b.fuelNeed or a.serviceReserve~=b.serviceReserve
-        or (a.station~=nil)~=(b.station~=nil)
+        or (a.station~=nil)~=(b.station~=nil) or a.relocate~=b.relocate
         or #a.route~=#b.route or #a.cells~=#b.cells then return false end
     if a.station and (a.station.facing~=b.station.facing or a.station.fuelTarget~=b.station.fuelTarget) then return false end
     for i,p in ipairs(a.route) do if b.route[i]~=p then return false end end
@@ -249,6 +292,7 @@ local function emptySlot()
     return false
 end
 
+local moveFailures={}
 local function step(to,mine,back)
     local suffix,h=M.step(pos(),to)
     if h and not face(h) then return end
@@ -273,8 +317,16 @@ local function step(to,mine,back)
         return
     end
     if not motion(suffix=="" and "forward" or suffix:lower(),to,nil,back,mine) then
-        local _,_,paused=inspect(suffix)
-        if not paused then announce("blocked","Move failed at "..to,"move_failed"); sleep(5) end
+        local still,_,paused=inspect(suffix)
+        if not paused then
+            moveFailures[to]=(moveFailures[to] or 0)+1
+            -- Empty but impassable (world limit, entity that never leaves): record
+            -- it as blocked/unverified instead of holding the patch forever.
+            if mine and not still and moveFailures[to]>=3 then
+                s.outcomes[to]="blocked"; commit(s)
+            end
+            announce("blocked","Move failed at "..to,"move_failed"); sleep(5)
+        end
     end
 end
 
@@ -498,7 +550,8 @@ end
 
 local function stationStep(g)
     local station=g.station
-    assert(pos()==g.route[#g.route] and not s.request,"station access outside active bay")
+    local bay=g.relocate and g.route[1] or g.route[#g.route]
+    assert(pos()==bay and not s.request,"station access outside active bay")
     if not face(headings[station.facing]) then return end
     if not s.bayVerified then
         assert(locate()==pos(),"GPS cannot verify the service bay")
@@ -533,7 +586,8 @@ local function stationStep(g)
         end
     end
     if not hasCargo and fuel()>=target then
-        s.returning=true; s.stationComplete=true; commit(s); return
+        -- A newcomer heads on to its parking cell instead of returning.
+        s.returning=not g.relocate or nil; s.stationComplete=true; commit(s); return
     end
     local ok,why,reason=stationPull(cap,target)
     if ok or reason=="guard_wait" then return end
@@ -550,25 +604,258 @@ local function request(kind,fields)
     commit(s)
 end
 
+-- Automatic setup. Nothing here needs a config file: the first turtle
+-- measures the quarry from its own start cell, and later turtles register by
+-- being placed in that same cell (the bay). Setup is journaled in SETUP and
+-- every step is re-derived from GPS, so a reboot simply repeats it.
+local function installStartup()
+    local program="/"..(shell.getRunningProgram():gsub("^/+",""):gsub("%.lua$",""))
+    local hook=('shell.execute("%s","auto")'):format(program)
+    if fs.isDir("/startup") then
+        local path="/startup/99_chunk_dig_swarm.lua"
+        if not fs.exists(path) then
+            local h=fs.open(path,"w"); h.write(hook.."\n"); h.close()
+            print("Added "..path.." so this turtle resumes after reboots")
+        end
+        return
+    end
+    local old=""
+    if fs.exists("/startup.lua") then
+        local h=fs.open("/startup.lua","r"); old=h.readAll() or ""; h.close()
+    end
+    if old:find(hook,1,true) then return end
+    if old~="" and not fs.exists("/startup.lua.before_swarm") then
+        local h=fs.open("/startup.lua.before_swarm","w"); h.write(old); h.close()
+    end
+    local sep=(old=="" or old:sub(-1)=="\n") and "" or "\n"
+    local h=fs.open("/startup.lua","w"); h.write(old..sep..hook.."\n"); h.close()
+    print("Added swarm auto-resume to the end of /startup.lua (previous copy: /startup.lua.before_swarm)")
+end
+
+local function findCoordinator()
+    M.openModem()
+    print("Looking for the swarm coordinator...")
+    local found={rednet.lookup(M.protocol)}
+    if #found==0 then error("No swarm coordinator answered; start swarm_coordinator on the dashboard computer first",0) end
+    if #found>1 then error("More than one swarm coordinator answered; run only one",0) end
+    return found[1]
+end
+
+local function setupRpc(msg)
+    tokenCounter=tokenCounter+1
+    local token=("setup%.0f:%.0f"):format(s.boot,tokenCounter)
+    local out={version=1,token=token}
+    for k,v in pairs(msg) do out[k]=v end
+    rednet.send(s.coordinator,out,M.protocol)
+    local deadline=os.clock()+3
+    while os.clock()<deadline do
+        local from,reply=rednet.receive(M.protocol,math.max(0.05,deadline-os.clock()))
+        if not from then break end
+        if from==s.coordinator and type(reply)=="table" and reply.version==1
+            and reply.token==token and reply.kind==msg.kind then
+            if reply.error then return nil,reply.error end
+            assert(type(reply.result)=="table" and type(reply.quarryId)=="string"
+                and type(reply.manifestId)=="string" and type(reply.dimension)=="string",
+                "invalid coordinator response")
+            return reply.result,reply
+        end
+    end
+end
+
+local function setupCall(msg)
+    while true do
+        local result,ident=setupRpc(msg)
+        if result or ident then return result,ident end
+        announce("waiting_swarm","Waiting for coordinator reply","coordinator_unreachable")
+        sleep(2)
+    end
+end
+
+local function finishSetup(result,ident,grant,current)
+    -- Any main state here is a leftover from a reboot before SETUP was removed;
+    -- it was never used, and the coordinator answers define/join idempotently.
+    if fs.exists(DIR) then fs.delete(DIR) end
+    local st,save=M.store(DIR,true)
+    st={seq=result.seq,boot=0,worker=me,auto=true,stage=result.stage,stageHeading=result.heading,
+        coordinator=s.coordinator,quarryId=ident.quarryId,manifestId=ident.manifestId,
+        dimension=ident.dimension,heading=current,trail={grant and grant.route[1] or result.stage},
+        grant=grant,outcomes=grant and {} or nil}
+    save(st)
+    fs.delete(SETUP)
+    s,commit=st,save
+    installStartup()
+end
+
+local function setupFuel(need)
+    -- Same selective wired pull as the service bay: one coal block at a time.
+    while fuel()<need or s.stationFuelSlot do
+        if s.stationFuelSlot then settleStationFuel()
+        else
+            local limit=turtle.getFuelLimit()
+            local ok,why,reason=stationPull(type(limit)=="number" and limit or math.huge,need)
+            if not ok and reason~="guard_wait" then
+                announce("waiting_fuel",why.."; put coal blocks in the shared barrel",reason); sleep(5)
+            end
+        end
+    end
+end
+
+local function probeMove(suffix,what)
+    for _=1,20 do
+        local present,b=inspect(suffix)
+        if present then
+            if protected(b) then error("Cannot dig "..what.." ("..b.name.."); clear it and run chunk_dig_swarm",0) end
+            turtle["dig"..suffix]()
+        elseif (suffix=="Down" and turtle.down or turtle.forward)() then return
+        else sleep(1) end
+    end
+    error("Cannot move into "..what.."; clear it and run chunk_dig_swarm",0)
+end
+
+local function setupNew()
+    local bx,by,bz=M.xyz(s.bay)
+    local below=M.key(bx,by-1,bz)
+    turtle.inspectDown() -- drain the turtle command queue before GPS
+    local here=assert(locate(),"GPS unavailable")
+    if here==s.bay then
+        setupFuel(100)
+        announce("setup","Probing quarry heading (dig down, then forward; no turns)")
+        probeMove("Down","the block below the bay")
+        here=assert(locate(),"GPS unavailable")
+    end
+    if here==below then
+        probeMove("","the block ahead, below the bay")
+        here=assert(locate(),"GPS unavailable")
+    end
+    local x,y,z=M.xyz(here)
+    if y~=by-1 or math.abs(x-bx)+math.abs(z-bz)~=1 then
+        error("Setup found this turtle at "..here.."; put it back in the bay at "..s.bay
+            .." facing the quarry, then run chunk_dig_swarm",0)
+    end
+    local h=x>bx and 1 or x<bx and 3 or z>bz and 2 or 0
+    announce("setup","Defining "..s.chunks.." chunk quarry with the coordinator")
+    local result,ident=setupCall({kind="define",bay=s.bay,stage=here,heading=h,chunks=s.chunks,bottom=s.bottom})
+    if not result then error("Coordinator refused the quarry: "..tostring(ident),0) end
+    assert(result.seq==1 and result.stage==here and result.heading==h,"coordinator defined a different quarry")
+    finishSetup(result,ident,nil,h)
+    print("Quarry defined. Add more turtles by placing them in the bay at "..M.key(bx,by,bz)
+        .." and running chunk_dig_swarm")
+    return true
+end
+
+local joinWait={
+    bay_busy="Another turtle is using the bay. Lift this one out and try again in a moment.",
+    lane_busy="The bay lane is in use. Try again in a moment.",
+    no_parking="No free parking cell yet; the swarm digs more as it works. Try again later."
+}
+local function setupJoin()
+    local here=assert(locate(),"GPS unavailable")
+    if here~=s.bay then fs.delete(SETUP); error("Turtle moved during join; place it in the bay and retry",0) end
+    local result,ident=setupCall({kind="join",stage=here,fuel=turtle.getFuelLevel()})
+    if not result or result.reason then
+        -- Refusals change nothing on the coordinator, so nothing is kept here.
+        fs.delete(SETUP)
+        if result then print(joinWait[result.reason] or result.reason); return false end
+        error("Coordinator refused join: "..tostring(ident),0)
+    end
+    local g=result.grant
+    assert(type(g)=="table" and g.relocate and g.route[1]==here and g.route[#g.route]==result.stage
+        and g.station and headings[g.station.facing],"invalid join grant")
+    -- The barrel tells this turtle which way it faces. Turning cannot collide.
+    announce("setup","Finding the shared barrel beside the bay")
+    local hits={}
+    for turn=0,3 do
+        if peripheral.hasType("front","inventory") then hits[#hits+1]=turn end
+        turtle.turnRight()
+    end
+    if #hits~=1 then
+        error("Expected exactly one inventory beside the bay (the shared barrel), found "..#hits
+            .."; run chunk_dig_swarm again after fixing it",0)
+    end
+    for _=1,hits[1] do turtle.turnRight() end
+    finishSetup(result,ident,g,headings[g.station.facing])
+    print("Joined swarm; moving to parking "..s.stage.." after refuelling")
+    return true
+end
+
+if mode=="new" then
+    local chunks,bottom=tonumber(choice),tonumber(extra or "-64")
+    if not (chunks and chunks%1==0 and chunks>=1 and chunks<=8) then
+        error("Usage: chunk_dig_swarm new <chunks 1-8> [bottomY]",0)
+    end
+    if not (bottom and bottom%1==0) then error("bottomY must be a whole number",0) end
+    if fs.exists(DIR) then error("Saved swarm state exists; run chunk_dig_swarm resume",0) end
+    local here=assert(locate(),"GPS unavailable; a GPS constellation is required")
+    local _,hy=M.xyz(here)
+    if bottom>hy-1 then error("bottomY must be below the turtle",0) end
+    if not peripheral.hasType("back","inventory") then
+        error("Put the shared barrel directly behind this turtle (it should face into the quarry)",0)
+    end
+    local dock,why=stationDock()
+    if not dock then error(why or "Wired dock above the bay is blocked",0) end
+    local coordinator=findCoordinator()
+    s,commit=M.store(SETUP,true)
+    s={phase="new",worker=me,bay=here,chunks=chunks,bottom=bottom,coordinator=coordinator,boot=0}
+    commit(s)
+elseif mode=="join" then
+    if fs.exists(DIR) then error("Saved swarm state exists; run chunk_dig_swarm resume",0) end
+    local here=assert(locate(),"GPS unavailable; a GPS constellation is required")
+    local coordinator=findCoordinator()
+    s,commit=M.store(SETUP,true)
+    s={phase="join",worker=me,bay=here,coordinator=coordinator,boot=0}
+    commit(s)
+end
+if mode=="new" or mode=="join" or mode=="setup" then
+    if mode=="setup" then s,commit=M.store(SETUP) end
+    assert(s.worker==me and (s.phase=="new" or s.phase=="join") and M.xyz(s.bay),"invalid swarm setup journal")
+    s.boot=s.boot+1; commit(s)
+    M.openModem()
+    if not (s.phase=="new" and setupNew() or s.phase=="join" and setupJoin()) then return end
+    useState()
+    mode="resume"
+end
+
 local children=s.grant and checkGrant(s.grant)
 local function checkTrail()
-    assert(s.trail[1]==s.stage and #s.trail>=1 and type(s.heading)=="number"
+    assert(#s.trail>=1 and type(s.heading)=="number"
         and s.heading%1==0 and s.heading>=0 and s.heading<=3,"invalid saved trail")
+    local g=s.grant
+    local relocating=g and g.relocate
+    assert(s.trail[1]==s.stage or (relocating and s.trail[1]==g.route[1]),"invalid saved trail")
     if s.bayVerified or s.stationFuelSlot or s.stationComplete then
-        assert(s.grant and s.grant.station,"station state without a service grant")
-        assert(not s.stationComplete or (s.bayVerified and s.returning),"invalid completed service")
+        assert(g and g.station,"station state without a service grant")
+        assert(not s.stationComplete or (s.bayVerified and (s.returning or relocating)),"invalid completed service")
         if s.stationFuelSlot then
-            assert(s.bayVerified and pos()==s.grant.route[#s.grant.route] and not s.returning
+            local bay=relocating and g.route[1] or g.route[#g.route]
+            assert(s.bayVerified and pos()==bay and not s.returning
                 and not s.request and not s.motion and s.heading==headings[s.grant.station.facing]
                 and type(s.stationFuelSlot)=="number" and s.stationFuelSlot%1==0
                 and s.stationFuelSlot>=1 and s.stationFuelSlot<=16,"invalid saved station fuel slot")
         end
     end
-    if not s.grant then
+    if not g then
         assert(#s.trail==1 and not s.motion,"saved motion without assignment")
         return
     end
-    local g=s.grant
+    if relocating then
+        -- Bay -> lane -> parking, then the trail collapses to the parking cell.
+        if s.trail[1]~=s.stage then
+            for i,p in ipairs(s.trail) do assert(p==g.route[i],"saved relocation disagrees with grant") end
+        else assert(#s.trail==1,"invalid relocation trail") end
+        local m=s.motion
+        if m then
+            assert(not s.request and m.from==pos() and not m.back and not m.mine,"invalid pending move")
+            if m.heading then
+                assert(m.to==pos() and ((m.op=="turnLeft" and m.heading==(s.heading+3)%4)
+                    or (m.op=="turnRight" and m.heading==(s.heading+1)%4)),"invalid pending turn")
+            else
+                local suffix,h=M.step(pos(),m.to)
+                assert((not h or h==s.heading) and m.op==(suffix=="" and "forward" or suffix:lower())
+                    and s.trail[1]~=s.stage and m.to==g.route[#s.trail+1],"pending move outside relocation")
+            end
+        end
+        return
+    end
     for i,p in ipairs(s.trail) do
         if i<=#g.route then assert(p==g.route[i],"saved transit disagrees with grant")
         else
@@ -661,6 +948,21 @@ while true do
         else announce("waiting_swarm","Cannot verify saved assignment; holding position","coordinator_unreachable"); sleep(2) end
     elseif s.stationFuelSlot then
         settleStationFuel()
+    elseif s.grant.relocate then
+        -- Newcomer: unload and refuel in the bay, then drive the reserved lane to
+        -- parking. The whole route is reserved, so it continues without the coordinator.
+        local g=s.grant
+        if s.trail[1]~=s.stage and #s.trail==1 and not s.stationComplete then
+            stationStep(g)
+        elseif pos()~=s.stage then
+            announce("relocating","Moving from the bay to parking "..s.stage)
+            step(g.route[#s.trail+1],false,false)
+        elseif #s.trail>1 then
+            s.trail={s.stage}; commit(s)
+        elseif face(heading) then
+            assert(locate()==s.stage,"GPS cannot verify parking")
+            request("finish",{id=g.id,evidence={}})
+        end
     else
         local g=s.grant
         local connected=not s.returning and sync()
