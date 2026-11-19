@@ -128,6 +128,11 @@ local function validate(s)
         assert(s.box and s.station and a.bay==s.station.bay and integer(a.heading,0,3)
             and type(a.lane)=="table" and type(a.park)=="table" and #a.lane==#a.park
             and type(a.infra)=="table" and type(s.parked)=="table","invalid automatic layout")
+        assert(s.revoked==nil or type(s.revoked)=="table","invalid revocations")
+        for owner,id in pairs(s.revoked or {}) do
+            assert(integer(owner,0,2^31-1) and integer(id,1,s.nextId-1) and not s.active[owner]
+                and not s.parked[owner],"invalid revocation")
+        end
         local taken={}
         for owner,p in pairs(s.parked) do
             assert(integer(owner,0,2^31-1) and s.staging[p] and not taken[p],"invalid parking record")
@@ -163,8 +168,11 @@ local function validate(s)
             and (s.staging[r.stage] or (r.kind=="join" and s.auto and r.stage==s.auto.bay)),
             "invalid replay record")
         if r.kind=="join" then
-            assert(s.auto and r.stage==s.auto.bay and (not s.active[owner] or s.active[owner].relocate),
-                "invalid join replay")
+            assert(s.auto and r.stage==s.auto.bay and (not s.active[owner]
+                or (s.active[owner].relocate and not s.active[owner].departed)),"invalid join replay")
+        elseif r.kind=="depart" then
+            local g=s.active[owner]
+            assert(g and g.relocate and g.departed and g.id==r.id and home(g)==r.stage,"invalid depart replay")
         elseif r.kind=="claim" or r.kind=="service" then
             assert((r.fuel=="unlimited" or integer(r.fuel,0,2^52))
                 and ((s.active[owner] and r.reason==nil)
@@ -172,7 +180,8 @@ local function validate(s)
                         ((r.kind=="claim" and (r.reason=="no_safe_patch" or r.reason=="staging_reserved"
                             or r.reason=="patch_fuel"))
                         or (r.kind=="service" and (r.reason=="station_not_configured"
-                            or r.reason=="station_busy" or r.reason=="station_fuel_reserve"))))),
+                            or r.reason=="station_busy" or r.reason=="station_fuel_reserve"
+                            or r.reason=="join_pending"))))),
                 "invalid claim replay")
         else
             assert(r.kind=="finish" and not s.active[owner] and integer(r.id,1,s.nextId-1)
@@ -188,14 +197,16 @@ local function validate(s)
             and not ids[g.id] and s.staging[stage]
             and (g.relocate and g.fuelNeed==0
                 or g.fuelNeed==2*(#g.route-1+#g.cells)+s.margin+(g.serviceReserve or 0))
-            and s.replay[owner] and s.replay[owner].stage==g.route[1],
+            and s.replay[owner]
+            and s.replay[owner].stage==(g.relocate and g.departed and stage or g.route[1]),
             "invalid active grant")
         if g.relocate then
             -- A newcomer placed in the bay: service there, then drive to its parking cell.
             assert(s.auto and g.relocate==true and planned and #g.cells==0 and #g.route==#planned
                 and s.parked[owner]==stage and g.station.facing==s.station.facing
                 and g.station.fuelTarget==s.station.fuelTarget
-                and s.replay[owner].kind=="join","invalid relocation grant")
+                and (g.departed==nil or g.departed==true)
+                and s.replay[owner].kind==(g.departed and "depart" or "join"),"invalid relocation grant")
             for i,p in ipairs(g.route) do
                 assert(p==planned[#planned+1-i],"relocation route differs from parking route")
             end
@@ -309,6 +320,13 @@ function Queue.define(p)
     return s
 end
 
+-- Worst-case coordinator disk use: every layer partly mined (one character
+-- per cell), times the two committed generations plus the staged write.
+function Queue.diskNeeded(s)
+    local b=s.box
+    return 3*(b.y1-b.y0+1)*b.area+262144
+end
+
 function Queue.defineResult(s)
     local a=s.auto
     return {seq=1,stage=a.park[1],heading=a.heading,bay=a.bay}
@@ -411,7 +429,15 @@ local function serviceProposal(s,stage,fuel)
     local need=2*(#route-1)+s.margin
     if fuel<need then return nil,"station_fuel_reserve" end
     local used=reservations(s)
-    for _,p in ipairs(route) do if used[p] then return nil,"station_busy" end end
+    for _,p in ipairs(route) do
+        if used[p] then
+            local g=s.active[used[p]]
+            -- A newcomer that never left the bay is holding it. Placing any
+            -- turtle in the bay (or that one again) clears this.
+            if g.relocate and not g.departed then return nil,"join_pending" end
+            return nil,"station_busy"
+        end
+    end
     return {route=copy(route),cells={},fuelNeed=need,
         station={facing=s.station.facing,fuelTarget=s.station.fuelTarget}}
 end
@@ -496,7 +522,9 @@ end
 
 -- A turtle placed in the bay asks for a parking cell. The bay itself is the
 -- check that it belongs here; joins are idempotent while its grant is active.
--- Refusals change nothing, so the user can lift the turtle out and retry.
+-- Refusals change nothing (so the user can lift the turtle out and retry),
+-- except that an earlier newcomer that never departed is cancelled: two
+-- turtles cannot both be in the bay, so that one was picked up.
 function Queue:join(worker,stage,fuel)
     if self.frozen then return nil,"queue_frozen" end
     local s=self.state
@@ -507,13 +535,31 @@ function Queue:join(worker,stage,fuel)
     if stage~=s.auto.bay then return nil,"not_at_bay" end
     local active=s.active[worker]
     if active then
-        if active.relocate and active.route[1]==stage then
+        if active.relocate and not active.departed and active.route[1]==stage then
             return {seq=s.replay[worker].seq,grant=copy(active),stage=home(active),heading=s.auto.heading}
         end
         return nil,"already_working"
     end
+    local nextState=copy(s)
+    local holder=reservations(s)[stage]
+    local held=holder and s.active[holder]
+    if held and held.relocate and not held.departed then
+        -- That newcomer never got permission to leave the bay, and this turtle
+        -- is standing in the bay now, so it was picked up. Cancel its join.
+        nextState.active[holder],nextState.parked[holder]=nil,nil
+        nextState.revoked=nextState.revoked or {}
+        nextState.revoked[holder]=held.id
+        s=nextState
+        nextState=copy(s)
+    end
+    local revoked=s~=self.state
+    local function refuse(reason)
+        -- Refusals change nothing, except that a cancelled join is still recorded.
+        if revoked then return self:_publish(s,{reason=reason}) end
+        return {reason=reason}
+    end
     local used=reservations(s)
-    if used[stage] then return {reason="bay_busy"} end
+    if used[stage] then return refuse("bay_busy") end
     local slot=s.parked[worker]
     if not slot then
         local taken={}
@@ -522,23 +568,44 @@ function Queue:join(worker,stage,fuel)
             if s.staging[p] and not taken[p] then slot=p; break end
         end
     end
-    if not slot then return {reason="no_parking"} end
+    if not slot then return refuse("no_parking") end
     local planned=s.station.routes[slot]
     local route={}
     for i=#planned,1,-1 do
-        if used[planned[i]] then return {reason="lane_busy"} end
+        if used[planned[i]] then return refuse("lane_busy") end
         route[#route+1]=planned[i]
     end
     assert(s.nextId<2^52,"assignment IDs exhausted")
     local grant={id=s.nextId,worker=worker,relocate=true,route=route,cells={},fuelNeed=0,
         station={facing=s.station.facing,fuelTarget=s.station.fuelTarget}}
-    local nextState=copy(s)
+    if nextState.revoked then nextState.revoked[worker]=nil end
     local seq=(s.replay[worker] and s.replay[worker].seq or 0)+1
     nextState.nextId=s.nextId+1
     nextState.active[worker]=grant
     nextState.parked[worker]=slot
     nextState.replay[worker]={seq=seq,kind="join",stage=stage,fuel=fuel}
     return self:_publish(nextState,{seq=seq,grant=grant,stage=slot,heading=s.auto.heading})
+end
+
+-- A serviced newcomer asks before its first move out of the bay. Until this
+-- is committed it cannot have left, which is what lets join() above cancel it.
+function Queue:depart(worker,seq,stage,id)
+    local ok,why=checkRequest(self,worker,seq,stage)
+    if not ok then return nil,why end
+    local s=self.state
+    local old=s.replay[worker]
+    if old and seq<=old.seq then
+        if seq==old.seq and old.kind=="depart" and old.stage==stage and old.id==id then
+            return {seq=seq,departed=id}
+        end
+        return nil,"stale_request"
+    end
+    local g=s.active[worker]
+    if not g or not g.relocate or g.id~=id or home(g)~=stage then return nil,"assignment_mismatch" end
+    local nextState=copy(s)
+    nextState.active[worker].departed=true
+    nextState.replay[worker]={seq=seq,kind="depart",stage=stage,id=id}
+    return self:_publish(nextState,{seq=seq,departed=id})
 end
 
 return Queue

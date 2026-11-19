@@ -131,6 +131,14 @@ if not state then
             local id=("swarm-%d-%.0f"):format(os.getComputerID(),epoch)
             local ok,built=pcall(Queue.define,{worker=sender,bay=m.bay,park=m.stage,heading=m.heading,
                 chunks=m.chunks,bottom=m.bottom,quarryId=id,manifestId=id.."-auto",dimension="auto"})
+            if ok and fs.getFreeSpace then
+                local need,free=Queue.diskNeeded(built),fs.getFreeSpace("/")
+                if free~="unlimited" and free<need then
+                    ok,built=false,("Coordinator disk too small: %d chunk(s) down to y=%d may need %d KB, %d KB free."
+                        .." Use fewer chunks or a higher bottomY"):format(m.chunks,m.bottom,math.ceil(need/1024),
+                        math.floor(free/1024))
+                end
+            end
             if ok then
                 local _,save=M.store(STATE,true)
                 save(built)
@@ -169,6 +177,10 @@ while true do
             local result,why=q:join(sender,m.stage,m.fuel)
             if result or why then reply(sender,c,m,result,why) end
         end
+    elseif request(m) and M.sameJob(c,m) and (m.kind=="sync" or m.kind=="depart")
+        and q.state.revoked and q.state.revoked[sender]==m.id and not q.state.active[sender] then
+        -- Its join was cancelled after it was picked up from the bay.
+        reply(sender,c,m,nil,"join_revoked")
     elseif request(m) and (m.kind=="define" or m.kind=="join") then
         reply(sender,c,m,nil,"This coordinator runs a manual manifest; automatic setup is unavailable")
     elseif request(m) and M.sameJob(c,m) and type(m.stage)=="string" and authorized(sender,m.stage) then
@@ -177,6 +189,8 @@ while true do
             result,why=q:claim(sender,m.seq,m.stage,m.fuel)
         elseif m.kind=="service" then
             result,why=q:service(sender,m.seq,m.stage,m.fuel)
+        elseif m.kind=="depart" then
+            result,why=q:depart(sender,m.seq,m.stage,m.id)
         elseif m.kind=="finish" then
             -- Trusted worker emits this only from a persisted, disarmed terminal checkpoint.
             result,why=q:finish(sender,m.seq,m.stage,m.id,m.evidence)

@@ -9,6 +9,8 @@ except ImportError:
 
 
 HARNESS = r'''
+printed={}
+FREE=1000000
 local clock, jobs, inbox, files, dirs, robots, world, packets = 0, {}, {}, {}, {}, {}, {}, {}
 local cuts, events = {}, {}
 local inventories,docks,hosts={},{},{}
@@ -45,6 +47,7 @@ local function env(id,program)
     e.fs={
         combine=function(a,b) return (a=="/" and "" or a).."/"..b end,
         getDir=function() return "/" end,
+        getFreeSpace=function() return FREE end,
         exists=function(p) return f[p]~=nil or d[p]~=nil end,
         isDir=function(p) return d[p]~=nil end,
         makeDir=function(p) d[p]=true end,
@@ -71,7 +74,7 @@ local function env(id,program)
     e.os={clock=function() return clock end,getComputerLabel=function() return "Test "..id end,
         getComputerID=function() return id end}
     e.sleep=function(n) coroutine.yield(clock+n) end
-    e.print=function() end
+    e.print=function(...) printed[#printed+1]=table.concat({...}," ") end
     e.peripheral={find=function() return {isWireless=function() return true end} end,
         getName=function() return "right" end,
         hasType=function(side,kind)
@@ -637,6 +640,117 @@ function auto_join_before_define_is_refused()
     assert(not ok and tostring(why):find("No quarry defined yet",1,true),tostring(why))
     assert(not dirs[5]["/.chunk_dig_swarm_setup"] and not dirs[5]["/.chunk_dig_swarm"] and robots[5].moves==0)
 end
+
+local function pickUp(id)
+    robots[id],jobs[id],inbox[id]=nil,nil,{}
+end
+
+function auto_newcomer_picked_up_before_leaving_bay()
+    autoFixture(-2)
+    place(1,0,0)
+    launch(1,worker,"new","1","-2")
+    drive(function() return snapshot(1) and staged()>=2 end,60000)
+    drive(function() return bayFree() end,60000)
+    place(2,2,0)
+    launch(2,worker)
+    drive(function() local s=snapshot(2); return s and s.grant end,60000)
+    assert(robots[2].x==0 and robots[2].y==0 and robots[2].z==0)
+    local revokedId=queue().active[2].id
+    pickUp(2) -- lifted out of the bay before it departed
+    local keep2,keepFiles2=dirs[2],files[2]
+    local start=clock
+    drive(function() return clock>start+30 end)
+    assert(queue().active[2]) -- a missed heartbeat alone does not free the bay
+    -- Turtle 3 goes in the bay; that cancels turtle 2's join.
+    place(3,1,0)
+    launch(3,worker)
+    drive(function() return parkedAt(3,"1,-1,-1") end,60000)
+    local q=queue()
+    assert(q.revoked[2]==revokedId and not q.active[2] and not q.parked[2])
+    -- Turtle 1 can use the bay again, and the layer gets finished.
+    drive(function()
+        local s=queue()
+        return s.layers[-1]=="c"
+    end,600000)
+    -- Turtle 2 put back later forgets its cancelled join and does not move.
+    drive(function() return bayFree() end,60000)
+    place(2,2,0)
+    dirs[2],files[2]=keep2,keepFiles2
+    launch(2,worker,"auto")
+    local ok,why=pcall(drive,function() return jobs[2]==nil end,60000)
+    assert(not ok and tostring(why):find("join was cancelled",1,true),tostring(why))
+    assert(not dirs[2]["/.chunk_dig_swarm"] and robots[2].moves==0)
+    -- Running it again joins normally.
+    inbox[2]={}
+    launch(2,worker)
+    drive(function() local s=snapshot(2); return s and s.auto and queue().parked[2] end,6000)
+end
+
+function auto_newcomer_put_back_resumes()
+    autoFixture(-1)
+    place(1,0,0)
+    launch(1,worker,"new","1","-1")
+    drive(function() return snapshot(1) and staged()>=2 end,60000)
+    drive(function() return bayFree() end,60000)
+    place(2,2,0)
+    launch(2,worker)
+    drive(function() return queue().active[2] end,60000)
+    local r=robots[2]
+    local keep=dirs[2]
+    pickUp(2)
+    local start=clock
+    drive(function() return clock>start+30 end)
+    robots[2]=r
+    launch(2,worker)
+    drive(function() return parkedAt(2,"1,-1,-1") end,60000)
+    assert(not queue().revoked or not queue().revoked[2])
+    printed={}
+    launch(2,worker,"status")
+    drive(function() return jobs[2]==nil end)
+    assert(printed[1]:find("assignment none | saved 1,-1,-1 heading 0 (north)",1,true),printed[1])
+    printed={}
+    robots[9]={x=5,y=5,z=5,h=0,fuel=0,digs=0,moves=0,turns=0,items={},slot=1}
+    files[9],dirs[9],inbox[9]={},{},{}
+    launch(9,worker,"status")
+    drive(function() return jobs[9]==nil end)
+    assert(printed[1]=="No swarm job on this turtle",tostring(printed[1]))
+end
+
+function auto_newcomer_picked_up_during_setup_rejoins()
+    autoFixture(-2)
+    place(1,0,0)
+    launch(1,worker,"new","1","-2")
+    drive(function() return snapshot(1) and staged()>=2 end,60000)
+    drive(function() return bayFree() end,60000)
+    place(2,2,0)
+    launch(2,worker)
+    -- The coordinator committed the join, but the reply has not been saved.
+    drive(function() return queue().active[2] end,60000)
+    assert(dirs[2]["/.chunk_dig_swarm_setup"] and not snapshot(2))
+    local keepDirs,keepFiles=dirs[2],files[2]
+    pickUp(2)
+    place(3,1,0)
+    launch(3,worker)
+    drive(function() return parkedAt(3,"1,-1,-1") end,60000)
+    assert(queue().revoked[2])
+    drive(function() return bayFree() end,60000)
+    place(2,2,0)
+    dirs[2],files[2]=keepDirs,keepFiles
+    launch(2,worker,"auto") -- the unfinished setup asks again and gets a new spot
+    drive(function() return parkedAt(2,"2,-1,-1") end,60000)
+    assert(not queue().revoked[2])
+end
+
+function auto_define_refused_when_coordinator_disk_is_too_small()
+    autoFixture(-1)
+    FREE=100000
+    place(1,0,0)
+    launch(1,worker,"new","8","-64")
+    local ok,why=pcall(drive,function() return jobs[1]==nil end,60000)
+    assert(not ok and tostring(why):find("Coordinator disk too small",1,true),tostring(why))
+    assert(not dirs[1]["/.chunk_dig_swarm_setup"] and not dirs[1]["/.chunk_dig_swarm"] and not queue())
+    FREE=1000000
+end
 '''
 
 
@@ -701,6 +815,18 @@ class SwarmRuntimeTests(unittest.TestCase):
 
     def test_zero_config_join_before_define_is_refused(self):
         self.lua.globals().auto_join_before_define_is_refused()
+
+    def test_zero_config_newcomer_picked_up_before_leaving_bay(self):
+        self.lua.globals().auto_newcomer_picked_up_before_leaving_bay()
+
+    def test_zero_config_newcomer_put_back_resumes(self):
+        self.lua.globals().auto_newcomer_put_back_resumes()
+
+    def test_zero_config_newcomer_picked_up_during_setup_rejoins(self):
+        self.lua.globals().auto_newcomer_picked_up_during_setup_rejoins()
+
+    def test_zero_config_define_refused_when_coordinator_disk_is_too_small(self):
+        self.lua.globals().auto_define_refused_when_coordinator_disk_is_too_small()
 
 
 if __name__ == "__main__":

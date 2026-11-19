@@ -293,7 +293,7 @@ wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked
 ### Kick it off
 
 1. Dashboard computer: `swarm_coordinator`. It waits for the first turtle. To keep the dashboard on the same computer, run `bg swarm_coordinator` and then start `turtle_wireless_dash` as usual.
-2. First turtle, in the bay facing the quarry: `chunk_dig_swarm new 1`. The number is the chunk count (1 to 8). An optional second number sets the bottom Y (default `-64`), for example `chunk_dig_swarm new 2 10`.
+2. First turtle, in the bay facing the quarry: `chunk_dig_swarm new 1`. The number is the chunk width (1 to 8; the quarry is that many chunks on each side). The coordinator refuses sizes its disk cannot hold, see Size limits below. An optional second number sets the bottom Y (default `-64`), for example `chunk_dig_swarm new 2 10`.
 3. Every later turtle: place it in the bay, in any facing and with no fuel, and run `chunk_dig_swarm`. It finds the barrel by turning in place, unloads and refuels from the barrel, drives the lane to the next free parking spot, and starts mining. Add one turtle at a time. If the bay is busy, or no parking spot has been dug yet, it says so and does nothing: lift it out and try again shortly.
 
 What the first turtle does: it checks GPS, the barrel behind it, and the wired dock. If its fuel is under 100, it takes coal blocks from the barrel. It then digs and moves one block down and one block forward, without turning, so GPS reveals its facing. It reports the bay, facing, and chunk count to the coordinator, which builds the quarry ledger. That second cell becomes its parking spot. The turtle never treats a later position as a new home.
@@ -302,12 +302,47 @@ What the first turtle does: it checks GPS, the barrel behind it, and the wired d
 
 No chunk loaders are needed. When a turtle's chunk unloads, it simply stops. On first setup, each turtle appends `shell.execute("/chunk_dig_swarm","auto")` to the end of its existing `/startup.lua`, after any lines already there (for example `shell.execute("/chunk_dig", "auto")`), and saves the original as `/startup.lua.before_swarm`. If the turtle uses a `/startup/` folder instead, it adds `/startup/99_chunk_dig_swarm.lua`. `auto` resumes saved swarm work or unfinished setup, and does nothing on a turtle with neither. On an advanced computer, the coordinator puts `if multishell then shell.openTab("/swarm_coordinator") end` at the top of `/startup.lua`, with the same backup, so the dashboard program below it still runs. On a basic computer it prints a reminder to add `swarm_coordinator` to startup yourself.
 
-Recovery is GPS-based. An interrupted setup repeats from GPS: the probe only ever moves down and then forward, and a newcomer re-finds the barrel by turning. A pending move resolves by comparing GPS with both saved positions. An interrupted turn during mining cannot be resolved by GPS, so the turtle stops. Check its facing, then run `chunk_dig_swarm resolve before` or `resolve after`. `chunk_dig_swarm status` shows saved state. Missing heartbeats, reboots, and coordinator restarts never release a reservation. A worker that cannot reach the coordinator after a reboot holds still until it can. Independent world or filesystem rollback is not automatically recoverable.
+Recovery is GPS-based. An interrupted setup repeats from GPS: the probe only ever moves down and then forward, and a newcomer re-finds the barrel by turning. A pending move resolves by comparing GPS with both saved positions. An interrupted turn during mining cannot be resolved by GPS, so the turtle stops; follow the checklist below. `chunk_dig_swarm status` shows saved state. Missing heartbeats, reboots, and coordinator restarts never release a reservation. A worker that cannot reach the coordinator after a reboot holds still until it can. Independent world or filesystem rollback is not automatically recoverable.
+
+### If you pick up a turtle
+
+- Picked up from the bay before it left (a newcomer still checking the barrel, or any turtle being serviced): put the same turtle back in the bay, facing the way `chunk_dig_swarm status` shows, and run `chunk_dig_swarm`. It continues where it stopped. If any items dropped when you picked it up, put them in the barrel.
+- A newcomer you do not want back: place any other turtle in the bay and run `chunk_dig_swarm`. Two turtles cannot be in the bay at once, so the coordinator cancels the old newcomer's join and frees its parking spot. If the old turtle is placed again later, it prints that its join was cancelled, deletes its own `/.chunk_dig_swarm`, and does not move. Run `chunk_dig_swarm` in the bay to join it again.
+- While a newcomer still holds the bay, other turtles wait at parking with `join_pending`. A missed heartbeat alone never frees the bay.
+- Picked up after it left the bay (in the lane, the parking row, or the quarry): put it back at the position and heading `chunk_dig_swarm status` shows, and run `chunk_dig_swarm`. Its reserved area is not released; there is still no command to release a turtle that has started moving.
+
+### Checklist: status and resolve
+
+Use this when a turtle stopped with a message about a pending turn or move, or you are not sure what it was doing.
+
+1. Stop the program if it is still running (hold Ctrl+T). Do not move the turtle by hand, and do not delete `/.chunk_dig_swarm`.
+2. Run `chunk_dig_swarm status`.
+   - `Swarm setup in progress` means setup was interrupted. Leave the turtle where it is and run `chunk_dig_swarm`; setup repeats from GPS.
+   - `No swarm job on this turtle` means there is nothing to recover.
+   - Otherwise it prints `Swarm <quarry> | assignment <id or none> | saved <x,y,z> heading <n> (<direction>)`. Headings are 0 north, 1 east, 2 south, 3 west.
+3. Read the `Pending` lines, if any.
+   - `Pending forward|up|down: A -> B` is a move. Nothing to do: on resume GPS decides whether the turtle is at A or B. Go to step 6.
+   - `Pending turnLeft|turnRight: P -> P, heading a -> b` is a turn that GPS cannot check. Continue with step 4.
+   - `Pending <kind> #<n>` is a coordinator request waiting for a reply. Make sure the coordinator computer is running, then go to step 6.
+4. Check which way the turtle actually faces. Press F3 and look at the block in front of the turtle (`Targeted Block` coordinates compared with the turtle's coordinates), or note the direction its front face points. North is -Z, east is +X, south is +Z, west is -X.
+5. If it still faces heading `a`, run `chunk_dig_swarm resolve before`. If it faces heading `b`, run `chunk_dig_swarm resolve after`. If it faces neither, do not guess. Turn it back to `a` with the Lua prompt (`turtle.turnLeft()` or `turtle.turnRight()`), check again, then run `resolve before`.
+6. Run `chunk_dig_swarm` (or `chunk_dig_swarm resume`). It checks GPS against the saved position before moving, and stops again if they disagree.
+
+`resolve` refuses to run when nothing is pending or when the pending step is a move.
 
 ### Running notes
 
 - Each turtle keeps its own parking spot as home and uses the bay one at a time, the same way standalone does. At the bay it burns carried coal blocks, unloads cargo, and pulls single coal blocks through the wired dock. It visits the bay when it has cargo, when fuel is below 800, or when a reachable patch needs more fuel.
 - Parking is limited to the dug parking row: 16 spots per chunk width, up to 64.
+
+### Size limits
+
+These are limits of this script, not of CC:Tweaked.
+
+- Disk: the coordinator saves the whole quarry map, one character per block for every layer that is partly mined, and keeps two saved copies plus one being written. Before accepting `new`, it checks the worst case (3 x layers x width squared, plus 256 KB) against its free disk space and refuses if it does not fit. On the default 1 MB computer, a quarry from about y=70 down to -64 fits at 1 or 2 chunks, not 3 or more. A server with a larger `computer_space_limit` allows more.
+- Speed: each assignment searches outward through the cleared space, so it slows as the quarry grows. In offline tests at 8 chunks it rose from about 45 ms to over 400 ms in plain Lua after 800 assignments; in game it is slower.
+- Parking: one row along the quarry edge, 16 spots per chunk width, capped at 64. All turtles share one bay, so beyond a handful of turtles extra ones mostly queue for the bay.
+- Chunks: 8 at most, which keeps the map validation and route sizes bounded.
 - When nothing reachable remains, turtles wait at parking with `no_safe_patch`. Bedrock and protected Allthemodium ores stay blocked, and cells that cannot be entered are reported as blocked or unverified, never as cleared.
 - The dashboard shows the swarm job, assigned area (including `moving to parking`), and waiting reason alongside normal telemetry.
 - Do not change the bay layout or start another coordinator during a quarry. To start a new quarry, let all turtles park, stop everything, delete `/.chunk_dig_swarm_coordinator` on the dashboard computer and `/.chunk_dig_swarm` on each turtle, then repeat the kick-off steps. The swarm never opens a standalone `/.chunk_dig` job.

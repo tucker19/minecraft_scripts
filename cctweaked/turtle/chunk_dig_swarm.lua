@@ -29,6 +29,10 @@ if mode=="status" and fs.exists(SETUP) then
     print("Swarm setup in progress; run chunk_dig_swarm to continue it")
     return
 end
+if mode=="status" and not fs.exists(DIR) then
+    print("No swarm job on this turtle")
+    return
+end
 local manual=fs.exists(MANUAL)
 local c,heading,serviceBelow
 local s,commit
@@ -74,10 +78,11 @@ end
 if s and not manual then useState() end
 local function pos() return s.trail[#s.trail] end
 if mode=="status" then
+    local function dir(h) return ("%d (%s)"):format(h,({[0]="north","east","south","west"})[h]) end
     print(("Swarm %s | assignment %s | saved %s heading %s"):format(
-        s.quarryId,s.grant and s.grant.id or "none",pos(),s.heading))
+        s.quarryId,s.grant and s.grant.id or "none",pos(),dir(s.heading)))
     if s.motion then print(("Pending %s: %s -> %s, heading %s -> %s"):format(
-        s.motion.op,s.motion.from,s.motion.to,s.heading,s.motion.heading or s.heading)) end
+        s.motion.op,s.motion.from,s.motion.to,dir(s.heading),dir(s.motion.heading or s.heading))) end
     if s.request then print("Pending "..s.request.kind.." #"..s.request.seq) end
     return
 end
@@ -169,6 +174,17 @@ local function rpc(request)
         local from,reply=rednet.receive(M.protocol,math.max(0.05,deadline-os.clock()))
         if not from then break end
         if from==c.coordinator and M.sameJob(c,reply) and reply.token==token and reply.kind==request.kind then
+            if reply.error=="join_revoked" then
+                -- Another turtle was placed in the bay while this one had not
+                -- left it, so this join was cancelled. Nothing outside the bay
+                -- depends on this turtle; forget the join.
+                local g=s.grant
+                assert(g and g.relocate and not s.departed and #s.trail==1 and s.trail[1]==g.route[1]
+                    and not s.motion,"Coordinator cancelled a join this turtle already acted on")
+                fs.delete(DIR)
+                error("This turtle's join was cancelled because another turtle used the bay. "
+                    .."Place it in the bay and run chunk_dig_swarm to join again.",0)
+            end
             if reply.error then error("Coordinator rejected "..request.kind..": "..reply.error,0) end
             assert(type(reply.result)=="table","invalid coordinator response")
             return reply.result
@@ -735,7 +751,12 @@ local function setupNew()
     local h=x>bx and 1 or x<bx and 3 or z>bz and 2 or 0
     announce("setup","Defining "..s.chunks.." chunk quarry with the coordinator")
     local result,ident=setupCall({kind="define",bay=s.bay,stage=here,heading=h,chunks=s.chunks,bottom=s.bottom})
-    if not result then error("Coordinator refused the quarry: "..tostring(ident),0) end
+    if not result then
+        -- Nothing was recorded on the coordinator, so forget this setup.
+        fs.delete(SETUP)
+        error("Coordinator refused the quarry: "..tostring(ident)..". Put this turtle back in the bay at "
+            ..s.bay.." facing the quarry and run chunk_dig_swarm new again.",0)
+    end
     assert(result.seq==1 and result.stage==here and result.heading==h,"coordinator defined a different quarry")
     finishSetup(result,ident,nil,h)
     print("Quarry defined. Add more turtles by placing them in the bay at "..M.key(bx,by,bz)
@@ -841,6 +862,7 @@ local function checkTrail()
         -- Bay -> lane -> parking, then the trail collapses to the parking cell.
         if s.trail[1]~=s.stage then
             for i,p in ipairs(s.trail) do assert(p==g.route[i],"saved relocation disagrees with grant") end
+            assert(#s.trail==1 or s.departed,"left the bay without departure")
         else assert(#s.trail==1,"invalid relocation trail") end
         local m=s.motion
         if m then
@@ -851,7 +873,8 @@ local function checkTrail()
             else
                 local suffix,h=M.step(pos(),m.to)
                 assert((not h or h==s.heading) and m.op==(suffix=="" and "forward" or suffix:lower())
-                    and s.trail[1]~=s.stage and m.to==g.route[#s.trail+1],"pending move outside relocation")
+                    and s.departed and s.trail[1]~=s.stage and m.to==g.route[#s.trail+1],
+                    "pending move outside relocation")
             end
         end
         return
@@ -893,21 +916,30 @@ local verifiedGrant=not s.grant
 local waiting={
     station_not_configured="Shared station is not configured on the coordinator",
     station_busy="Shared bay or its route is reserved; waiting at staging",
+    join_pending="A new turtle that joined has not left the bay. If it was picked up, place any turtle in the bay and run chunk_dig_swarm",
     station_fuel_reserve="Add starter fuel at staging; not enough for a round trip to the shared bay",
     patch_fuel="Not enough fuel for the reachable patch and the required return reserve"
 }
 while true do
     if s.request then
-        assert(pos()==s.stage and not s.motion and s.heading==heading,"invalid pending staging request")
+        if s.request.kind=="depart" then
+            assert(s.grant and s.grant.relocate and #s.trail==1 and pos()==s.grant.route[1] and not s.motion,
+                "invalid pending depart request")
+        else
+            assert(pos()==s.stage and not s.motion and s.heading==heading,"invalid pending staging request")
+        end
         local reply=rpc(s.request)
         if not reply then
             announce("waiting_swarm","Waiting for coordinator reply","coordinator_unreachable"); sleep(2)
         else
             assert(reply.seq==s.request.seq,"wrong coordinator sequence")
-            if s.request.kind=="finish" then
+            if s.request.kind=="depart" then
+                assert(s.grant and reply.departed==s.grant.id,"wrong depart acknowledgement")
+                s.departed=true
+            elseif s.request.kind=="finish" then
                 assert(s.grant and reply.finished==s.grant.id,"wrong finish acknowledgement")
                 if s.stationComplete then s.lastStationFuel=turtle.getFuelLevel() end
-                s.bayVerified,s.stationComplete=nil,nil
+                s.bayVerified,s.stationComplete,s.departed=nil,nil,nil
                 s.grant,s.outcomes,s.returning,children=nil,nil,nil,nil
             elseif reply.grant then
                 assert(not s.grant and (reply.grant.station~=nil)==(s.request.kind=="service"),
@@ -952,8 +984,13 @@ while true do
         -- Newcomer: unload and refuel in the bay, then drive the reserved lane to
         -- parking. The whole route is reserved, so it continues without the coordinator.
         local g=s.grant
-        if s.trail[1]~=s.stage and #s.trail==1 and not s.stationComplete then
+        local inBay=s.trail[1]~=s.stage and #s.trail==1
+        if inBay and not s.stationComplete then
             stationStep(g)
+        elseif inBay and not s.departed then
+            -- Ask before leaving. Until the coordinator records this, a turtle
+            -- found in the bay later proves this one was picked up.
+            request("depart",{id=g.id})
         elseif pos()~=s.stage then
             announce("relocating","Moving from the bay to parking "..s.stage)
             step(g.route[#s.trail+1],false,false)

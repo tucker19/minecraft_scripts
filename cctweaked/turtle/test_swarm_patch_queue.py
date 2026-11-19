@@ -87,12 +87,33 @@ class PatchQueueTests(unittest.TestCase):
             -- Duplicate join (lost reply) returns the same grant; others wait.
             local again=q:join(8,"0,70,0","unlimited")
             assert(again.grant.id==g.id and again.seq==1)
+            -- After the coordinator records its departure, the bay stays reserved.
+            assert(q:depart(8,2,"1,69,-1",g.id).departed==g.id)
+            assert(q:depart(8,2,"1,69,-1",g.id).departed==g.id)
             assert(q:join(9,"0,70,0",0).reason=="bay_busy")
             q=reopen()
-            assert(q:finish(8,2,"1,69,-1",g.id,{}))
+            assert(q:finish(8,3,"1,69,-1",g.id,{}))
             assert(not q.state.active[8] and q.state.parked[8]=="1,69,-1")
+            -- Turtle 9 joins but is picked up before departing. Its service
+            -- requests are told why, and the next turtle in the bay clears it.
+            local j9=q:join(9,"0,70,0",0)
+            assert(j9.grant and j9.stage=="2,69,-1")
+            local _,why=q:service(8,4,"1,69,-1",5000)
+            assert(q.state.replay[8].reason=="join_pending")
+            local j10=q:join(10,"0,70,0",0)
+            assert(j10.grant and j10.stage=="2,69,-1" and q.state.revoked[9]==j9.grant.id)
+            assert(not q.state.active[9] and not q.state.parked[9])
+            assert(q:depart(9,2,"2,69,-1",j9.grant.id)==nil)
+            q=reopen()
+            assert(q:depart(10,2,"2,69,-1",j10.grant.id))
+            assert(q:finish(10,3,"2,69,-1",j10.grant.id,{}))
+            -- Turtle 9 can join again later; that clears its revocation.
+            local again9=q:join(9,"0,70,0",0)
+            assert(again9.grant and not q.state.revoked[9])
+            assert(q:depart(9,again9.seq+1,again9.stage,again9.grant.id))
+            assert(q:finish(9,again9.seq+2,again9.stage,again9.grant.id,{}))
             -- Mining routes never use the service lane.
-            local m=claim(q,8,3,"1,69,-1",5000)
+            local m=claim(q,8,5,"1,69,-1",5000)
             for _,p in ipairs(m.grant.route) do assert(q.state.auto.infra[p]~="lane" or p==m.grant.route[1]) end
         """)
 

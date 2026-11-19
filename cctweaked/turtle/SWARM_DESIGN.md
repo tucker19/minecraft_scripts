@@ -60,3 +60,9 @@ The ledger stores each layer as one string of `u` (unclaimed), `c` (clear), or `
 A newcomer placed in the bay sends `join`. If any active grant holds the bay, the coordinator answers `bay_busy`; if no promoted parking cell is free, it answers `no_parking`. Both answers commit nothing. Otherwise it commits a relocation grant and a parking record together: route bay → lane → parking, service at the bay, and no work cells. A repeated join returns the same grant. The turtle then turns in place until exactly one side shows an inventory (the barrel), which gives its heading, and saves its first checkpoint. It services in the bay, drives the reserved route, and sends `finish` from parking. Authorization in automatic ledgers is the persisted parking record (`parked[worker] == stage`), so no worker list is needed.
 
 Startup integration appends `shell.execute("/chunk_dig_swarm","auto")` to existing turtle startup logic, or adds `/startup/99_chunk_dig_swarm.lua`, and backs up the original once. On advanced computers, the coordinator prepends a `multishell` tab launch. `auto` resumes saved work or unfinished setup and otherwise exits.
+
+### Cancelled joins and disk limits
+
+A newcomer's relocation grant stays reserved until the worker asks to `depart` from the bay (the coordinator records `departed` before it moves). If another turtle joins while the bay is held by a grant that never departed, the earlier newcomer must have been picked up, so its grant and parking cell are revoked (`revoked[worker]=grantId`). Its later `sync`/`depart` gets `join_revoked`; the worker deletes its untouched state and stops. A join answered before the worker saved it is simply asked again from the setup journal and gets a new grant. Departed grants and service grants are never revoked automatically.
+
+`define` is refused when `Queue.diskNeeded` (3 x layers x area + 256 KB) exceeds `fs.getFreeSpace("/")` on the coordinator; the first turtle then drops its setup journal.
