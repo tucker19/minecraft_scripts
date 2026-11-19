@@ -11,8 +11,8 @@ except ImportError:
 HARNESS = r'''
 local clock, jobs, inbox, files, dirs, robots, world, packets = 0, {}, {}, {}, {}, {}, {}, {}
 local cuts, events = {}, {}
-local inventories={}
-local cutSuck,loseFinish,duplicateService
+local inventories,docks={},{}
+local cutPush,loseFinish,duplicateService
 local COORD=99
 local function key(x,y,z) return x..","..y..","..z end
 local function clone(x)
@@ -74,9 +74,36 @@ local function env(id,program)
         hasType=function(side,kind)
             return r and kind=="inventory" and inventories[target(r,side=="top" and "Up" or "")]~=nil
         end,
-        call=function(side,method)
-            assert(side=="top" and method=="list")
-            return clone(inventories[target(r,"Up")].items)
+        wrap=function(side)
+            local dock=r and side=="top" and docks[target(r,"Up")]
+            if not dock or not dock.online then return end
+            return {
+                isWireless=function() return false end,
+                getNameLocal=function() return "turtle_"..id end,
+                getNamesRemote=function() return {"keepalive","shared_storage",dock.ambiguous and "other_storage" or nil} end,
+                getMethodsRemote=function(name)
+                    if name=="keepalive" then return {"turnOn"} end
+                    return {"list","getItemDetail","pushItems"}
+                end,
+                callRemote=function(name,method,a,from,n,into)
+                    assert(name=="shared_storage" and inventories[target(r,"")]==dock.storage)
+                    local inv=dock.storage
+                    if method=="list" then return clone(inv.items) end
+                    if method=="getItemDetail" then return clone(inv.items[a]) end
+                    assert(method=="pushItems" and a=="turtle_"..id and n==1 and not r.items[into])
+                    local d=assert(inv.items[from])
+                    assert(d.name=="minecraft:coal_block","attempted extraction from a cargo slot")
+                    inv.attempts=inv.attempts or {}; inv.attempts[#inv.attempts+1]=from
+                    if inv.blocked and inv.blocked[from] then return 0 end
+                    d.count=d.count-1
+                    r.items[into]={name=inv.wrongItem or d.name,count=1}
+                    if d.count==0 then inv.items[from]=nil end
+                    inv.taken=(inv.taken or 0)+1
+                    if inv.fullWhenCoal and d.count==0 then inv.full=false end
+                    if cutPush==id then cutPush=nil; coroutine.yield(math.huge,false,"cut") end
+                    tick(); return 1
+                end
+            }
         end}
     e.rednet={
         open=function() end,
@@ -109,33 +136,39 @@ local function env(id,program)
         e.gps={locate=function() return r.x,r.y,r.z end}
         e.turtle={
             getFuelLevel=function() return r.fuel end,
-            getFuelLimit=function() return r.fuel=="unlimited" and "unlimited" or 1000 end,
+            getFuelLimit=function() return r.fuel=="unlimited" and "unlimited" or (r.cap or 1000) end,
             getItemCount=function(i)
                 local d=r.items[i or r.slot]; return d and d.count or 0
             end,
             getItemDetail=function(i) return clone(r.items[i or r.slot]) end,
+            getItemSpace=function(i) return 64-(r.items[i] and r.items[i].count or 0) end,
             select=function(i) r.slot=i; return true end,
+            transferTo=function(i)
+                local a,b=r.items[i],r.items[r.slot]
+                if not a or not b or a.name~=b.name then return false end
+                local n=math.min(64-a.count,b.count)
+                a.count,b.count=a.count+n,b.count-n
+                if b.count==0 then r.items[r.slot]=nil end
+                tick(); return n>0
+            end,
             drop=function()
                 local inv=assert(inventories[target(r,"")])
-                if inv.full then return false end
+                if inv.full then return false,"No space for items" end
                 local d=assert(r.items[r.slot])
-                inv.items[#inv.items+1]=d; r.items[r.slot]=nil; tick(); return true
-            end,
-            suckUp=function(n)
-                local inv=assert(inventories[target(r,"Up")])
-                local d=inv.items[1]
-                if not d then return false end
-                assert(n==1 and not r.items[r.slot])
-                d.count=d.count-1; r.items[r.slot]={name=d.name,count=1}
-                if d.count==0 then inv.items[1]=nil end
-                inv.taken=(inv.taken or 0)+1
-                if cutSuck==id then cutSuck=nil; coroutine.yield(math.huge,false,"cut") end
+                local n=math.min(inv.partial or d.count,d.count)
+                local i=1; while inv.items[i] do i=i+1 end
+                inv.items[i]={name=d.name,count=n}
+                d.count=d.count-n
+                if d.count==0 then r.items[r.slot]=nil end
                 tick(); return true
             end,
+            suckUp=function() error("indiscriminate extraction must not be used") end,
             refuel=function(n)
                 local d=r.items[r.slot]
-                if not d or d.name~="minecraft:coal_block" then return false end
-                d.count=d.count-n; r.fuel=math.min(1000,r.fuel+800*n)
+                local value=d and ({["minecraft:coal_block"]=800,["minecraft:coal"]=80,["minecraft:charcoal"]=80})[d.name]
+                if not value then return false end
+                d.count=d.count-n; r.fuel=math.min(r.cap or 1000,r.fuel+value*n)
+                events[#events+1]={op="burn",id=id,name=d.name}
                 if d.count==0 then r.items[r.slot]=nil end
                 tick(); return true
             end,
@@ -303,35 +336,43 @@ local function stationFixture()
     local work={"0,-1,0","2,-1,0"}
     setup({a,b},work,{bay=bay,facing="south",fuelTarget=900,
         routes={[a]={a,hub,bay},[b]={b,hub,bay}}},{a,b,hub,bay})
-    world[out],world[top]="minecraft:barrel","minecraft:barrel"
-    inventories[out],inventories[top]={items={}},{items={{name="minecraft:coal_block",count=4}}}
+    world[out],world[top]="minecraft:barrel","computercraft:wired_modem_full"
+    inventories[out]={items={[1]={name="minecraft:stone",count=8},[5]={name="minecraft:coal_block",count=4}}}
+    docks[top]={online=true,storage=inventories[out]}
     robot(1,0,0,0,true,true)
     robot(2,2,0,0,true,true)
     for _,id in ipairs({1,2}) do
         robots[id].fuel=150
         robots[id].items[16]={name="minecraft:cobblestone",count=id}
     end
-    return work,bay,hub,inventories[out],inventories[top]
+    return work,bay,hub,inventories[out],docks[top]
+end
+
+local function stock(inv,name)
+    local n=0
+    for _,d in pairs(inv.items) do if d.name==name then n=n+d.count end end
+    return n
 end
 
 function station_contention_and_recovery()
-    local work,bay,hub,out,top=stationFixture()
-    cutSuck,duplicateService=1,1
+    local work,bay,hub,out=stationFixture()
+    cutPush,duplicateService=1,1
     launch(1,worker,"start")
     launch(2,worker,"start")
     drive(function() return jobs[1].cut and queue().replay[2] and queue().replay[2].reason=="station_busy" end)
     local g=queue().active[1]
     assert(g.station and #g.cells==0 and at(bay) and robots[2].moves==0)
-    assert(snapshot(1).stationFuelSlot and top.taken==1 and #out.items==1)
+    assert(snapshot(1).stationFuelSlot and out.taken==1 and stock(out,"minecraft:cobblestone")==1)
     jobs[COORD],inbox[COORD]=nil,{}
     launch(1,worker,"resume")
     local begin=clock
     drive(function() return clock>begin+12 end)
-    assert(queue().active[1].id==g.id and top.taken==1 and robots[2].moves==0)
+    assert(queue().active[1].id==g.id and out.taken==1 and robots[2].moves==0)
     launch(COORD,coordinator,"run")
     loseFinish=1
     drive(function() return finished(work) and not snapshot(1).grant and not snapshot(2).grant end)
-    assert(#out.items==2 and top.taken==2 and robots[1].fuel>=900 and robots[2].fuel>=900)
+    assert(stock(out,"minecraft:cobblestone")==3 and stock(out,"minecraft:stone")==8
+        and out.taken==2 and robots[1].fuel>=900 and robots[2].fuel>=900)
     local bayMoves={}
     for _,e in ipairs(events) do
         if e.op=="move" and e.p==bay then bayMoves[#bayMoves+1]=e.id end
@@ -344,9 +385,9 @@ local function saw(id,reason)
 end
 
 function station_waits_for_supplies_and_clear_route()
-    local work,bay,hub,out,top=stationFixture()
-    local stock=top.items[1]
-    top.items[1]=nil
+    local work,bay,hub,out,dock=stationFixture()
+    local coal=out.items[5]
+    out.items[5]=nil
     out.full=true
     robot(3,1,0,0,true)
     launch(1,worker,"start")
@@ -356,26 +397,68 @@ function station_waits_for_supplies_and_clear_route()
     assert(robots[1].moves==0 and robots[1].digs==0 and queue().active[1].station)
     robots[3]=nil
     drive(function() return saw(1,"station_output_full") end)
-    assert(at(bay) and robots[1].items[16].count==1 and not top.taken)
+    assert(at(bay) and robots[1].items[16].count==1 and not out.taken)
     out.full=false
+    dock.online=false
+    drive(function() return saw(1,"station_dock_missing") end)
+    assert(stock(out,"minecraft:cobblestone")==1 and not out.taken)
+    dock.online=true; dock.ambiguous=true
+    drive(function() return saw(1,"station_dock_ambiguous") end)
+    dock.ambiguous=false
     drive(function() return saw(1,"station_fuel_empty") end)
-    assert(at(bay) and #out.items==1 and queue().active[1].station)
-    top.items[1]={name="minecraft:stone",count=8}
-    drive(function() return saw(1,"station_fuel_contaminated") end)
-    assert(not top.taken and queue().active[1].station)
-    top.items[1]=stock
+    assert(at(bay) and stock(out,"minecraft:stone")==8 and not out.taken and queue().active[1].station)
+    out.items[5]=coal
     drive(function() return queue().work[work[1]]=="clear" and not queue().active[1] end)
-    assert(top.taken==1 and not at(bay) and robots[1].h==0)
+    assert(out.taken==1 and not at(bay) and robots[1].h==0)
 end
 
 function station_requires_round_trip_fuel()
-    local _,bay,_,out,top=stationFixture()
+    local _,bay,_,out=stationFixture()
     robots[1].fuel=4
     launch(1,worker,"start")
     drive(function() return saw(1,"station_fuel_reserve") end)
-    assert(robots[1].moves==0 and not queue().active[1] and not at(bay) and not top.taken)
+    assert(robots[1].moves==0 and not queue().active[1] and not at(bay) and not out.taken)
     robots[1].fuel=150
-    drive(function() return top.taken==1 end)
+    drive(function() return out.taken==1 end)
+end
+
+function station_frees_space_with_selective_fuel()
+    local work,_,_,out=stationFixture()
+    out.full,out.fullWhenCoal,out.partial=true,true,1
+    out.items[6]={name="minecraft:coal_block",count=1}
+    out.items[7]={name="minecraft:coal_block",count=1}
+    out.blocked={[6]=true}
+    for i=1,16 do robots[1].items[i]={name="minecraft:cobblestone",count=2} end
+    launch(1,worker,"start")
+    drive(function() return queue().work[work[1]]=="clear" and not queue().active[1] end)
+    assert(out.taken==1 and #out.attempts==2 and out.attempts[1]==6 and out.attempts[2]==7)
+    assert(stock(out,"minecraft:cobblestone")==32 and stock(out,"minecraft:stone")==8)
+    assert(robots[1].slot==1 and robots[1].fuel>=900)
+end
+
+function station_prefers_carried_coal_blocks_and_unloads_surplus()
+    local work,_,_,out=stationFixture()
+    robots[1].items[1]={name="minecraft:coal",count=3}
+    robots[1].items[15]={name="minecraft:coal_block",count=2}
+    launch(1,worker,"start")
+    drive(function() return queue().work[work[1]]=="clear" and not queue().active[1] end)
+    local burns=0
+    for _,e in ipairs(events) do
+        if e.op=="burn" then assert(e.name=="minecraft:coal_block"); burns=burns+1 end
+    end
+    assert(burns==1 and not out.taken)
+    assert(stock(out,"minecraft:coal")==3 and stock(out,"minecraft:coal_block")==5)
+end
+
+function station_stops_on_unexpected_delivery()
+    local _,bay,_,out=stationFixture()
+    out.wrongItem="minecraft:granite"
+    launch(1,worker,"start")
+    local ok,why=pcall(drive,function() return false end)
+    assert(not ok and tostring(why):find("Unexpected item in station fuel slot",1,true),tostring(why))
+    local slot=snapshot(1).stationFuelSlot
+    assert(at(bay) and slot and robots[1].items[slot].name=="minecraft:granite" and queue().active[1].station)
+    assert(out.taken==1 and robots[1].fuel<150 and stock(out,"minecraft:granite")==0)
 end
 '''
 
@@ -417,6 +500,15 @@ class SwarmRuntimeTests(unittest.TestCase):
 
     def test_shared_station_requires_round_trip_fuel(self):
         self.lua.globals().station_requires_round_trip_fuel()
+
+    def test_shared_station_makes_room_in_full_barrel_and_full_turtle(self):
+        self.lua.globals().station_frees_space_with_selective_fuel()
+
+    def test_shared_station_prefers_carried_coal_blocks_and_unloads_surplus(self):
+        self.lua.globals().station_prefers_carried_coal_blocks_and_unloads_surplus()
+
+    def test_shared_station_stops_on_unexpected_fuel_delivery(self):
+        self.lua.globals().station_stops_on_unexpected_delivery()
 
 
 if __name__ == "__main__":

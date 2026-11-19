@@ -278,11 +278,11 @@ local function step(to,mine,back)
     end
 end
 
-local allowedFuel={["minecraft:coal_block"]=true,["minecraft:coal"]=true,["minecraft:charcoal"]=true}
+local COAL_BLOCK="minecraft:coal_block"
+local allowedFuel={[COAL_BLOCK]=true,["minecraft:coal"]=true,["minecraft:charcoal"]=true}
 local function cargoSlot()
     for i=1,16 do
-        local d=turtle.getItemDetail(i)
-        if d and not allowedFuel[d.name] then return i end
+        if turtle.getItemCount(i)>0 then return i end
     end
 end
 local function service()
@@ -308,20 +308,192 @@ local function service()
     turtle.select(1)
 end
 
+-- Match the standalone shared base: burn carried coal blocks first, unload
+-- directly, and use only a selective wired transfer for external fuel.
+local function burn(slot)
+    local before=fuel()
+    turtle.select(slot)
+    local ok=turtle.refuel(1)
+    turtle.select(1)
+    return ok and fuel()>before
+end
+
+local function carried(need)
+    for _,blocksOnly in ipairs({true,false}) do
+        for i=1,16 do
+            while fuel()<need do
+                local d=turtle.getItemDetail(i)
+                if not d or (blocksOnly and d.name~=COAL_BLOCK) or not burn(i) then break end
+            end
+        end
+    end
+end
+
+local function verifyStationBuffer(slot)
+    local got=turtle.getItemDetail(slot)
+    if got and (got.name~=COAL_BLOCK or got.count~=1) then
+        local message="Unexpected item in station fuel slot "..slot.."; stop other access and remove it before resuming"
+        announce("recovery_required",message,"station_transfer_unverified")
+        error(message,0)
+    end
+    return got
+end
+
 local function settleStationFuel()
     local slot=s.stationFuelSlot
     if not slot then return end
-    local got=turtle.getItemDetail(slot)
-    if got then
-        assert(got.name=="minecraft:coal_block" and got.count==1,
-            "Unexpected item in station fuel slot "..slot.."; fix it before resuming")
-        local before=fuel()
-        turtle.select(slot)
-        assert(turtle.refuel(1) and fuel()>before and turtle.getItemCount(slot)==0,
-            "Cannot burn station coal block in saved fuel slot")
+    if verifyStationBuffer(slot) then
+        local cap=turtle.getFuelLimit()
+        if type(cap)=="number" and fuel()<cap then
+            if not burn(slot) then
+                announce("waiting_fuel","Cannot burn coal block in saved station slot "..slot,"station_fuel_rejected")
+                sleep(5); return
+            end
+            assert(turtle.getItemCount(slot)==0,"Coal block burn did not empty saved station slot")
+        end
     end
     turtle.select(1)
     s.stationFuelSlot=nil; commit(s)
+end
+
+local function wireCall(fn,...)
+    local ok,value=pcall(fn,...)
+    if ok then return value end
+    if value=="Terminated" then error(value,0) end
+    return nil,tostring(value)
+end
+
+local function stationDock()
+    local _,_,paused=inspect("Up")
+    if paused then return nil,nil,"guard_wait" end
+    local m=peripheral.wrap("top")
+    if not m or type(m.isWireless)~="function" or m.isWireless()
+        or type(m.getNameLocal)~="function" or type(m.getNamesRemote)~="function"
+        or type(m.getMethodsRemote)~="function" or type(m.callRemote)~="function" then
+        return nil,"Shared station requires a wired dock modem above the bay","station_dock_missing"
+    end
+    local id=wireCall(m.getNameLocal)
+    if type(id)~="string" or id=="" then
+        return nil,"Wired dock does not address this turtle; check peripheral mode and keepalive","station_dock_missing"
+    end
+    local names,why=wireCall(m.getNamesRemote)
+    if type(names)~="table" then
+        return nil,"Cannot enumerate wired station peripherals: "..tostring(why),"station_dock_missing"
+    end
+    local name,withDetail
+    for _,n in pairs(names) do
+        if n~=id then
+            local methods={}
+            for _,method in pairs(wireCall(m.getMethodsRemote,n) or {}) do methods[method]=true end
+            if methods.list and methods.pushItems then
+                if name then
+                    return nil,"Multiple wired inventories found; connect only the shared barrel and visiting turtle","station_dock_ambiguous"
+                end
+                name,withDetail=n,methods.getItemDetail
+            end
+        end
+    end
+    if not name then
+        return nil,"Shared storage must expose wired list and slot-specific pushItems","station_dock_missing"
+    end
+    return {id=id,detail=withDetail,call=function(method,...)
+        return wireCall(m.callRemote,name,method,...)
+    end}
+end
+
+local function stationBuffer(cap)
+    for i=1,16 do if turtle.getItemCount(i)==0 then return i end end
+    -- First merge compatible partial stacks; transferTo checks actual
+    -- compatibility even when two item names match.
+    for j=16,2,-1 do
+        local d=turtle.getItemDetail(j)
+        for i=1,j-1 do
+            local a=turtle.getItemDetail(i)
+            if d and a and a.name==d.name and turtle.getItemSpace(i)>0 then
+                turtle.select(j)
+                turtle.transferTo(i)
+                turtle.select(1)
+                if turtle.getItemCount(j)==0 then return j end
+            end
+        end
+    end
+    local max=math.floor((cap-fuel())/800)-1
+    local best,slot
+    for i=1,16 do
+        local d=turtle.getItemDetail(i)
+        if d and d.name==COAL_BLOCK and d.count<=max and (not best or d.count<best) then
+            best,slot=d.count,i
+        end
+    end
+    if slot then
+        for _=1,best do if not burn(slot) then return end end
+        return slot
+    end
+end
+
+local function coalSlot(items,tried)
+    local from,best,count=nil,nil,0
+    for i,d in pairs(items) do
+        if type(i)=="number" and i%1==0 and i>=1 and i<=2^31-1
+            and type(d)=="table" and d.name==COAL_BLOCK and type(d.count)=="number"
+            and d.count>0 and not tried[i] then
+            count=count+1
+            if not best or d.count<best or (d.count==best and i<from) then from,best=i,d.count end
+        end
+    end
+    return from,count
+end
+
+local function stationPull(cap,target)
+    if fuel()>=cap then return false,"Fuel tank has no room for a coal block","station_fuel_no_room" end
+    local headroom=cap-fuel()
+    if headroom<800 and fuel()>=target then
+        return false,"Fuel tank has no room for a coal block","station_fuel_no_room"
+    end
+    local dock,why,reason=stationDock()
+    if not dock then return false,why,reason end
+    local items,err=dock.call("list")
+    if type(items)~="table" then
+        return false,"Cannot list wired shared inventory: "..tostring(err),"station_fuel_rejected"
+    end
+    local tried={}
+    local _,attempts=coalSlot(items,tried)
+    if attempts==0 then return false,"No coal blocks exposed by the wired shared inventory","station_fuel_empty" end
+    local into=stationBuffer(cap)
+    if not into then return false,"All 16 slots occupied; no temporary coal-block buffer","station_fuel_no_slot" end
+    assert(turtle.getItemCount(into)==0,"Station fuel destination is not empty")
+    announce("refueling","Taking a coal block from shared station inventory")
+    s.stationFuelSlot=into; commit(s)
+    local problem="Coal slots changed before transfer"
+    for _=1,attempts do
+        items,err=dock.call("list")
+        if type(items)~="table" then
+            problem="Cannot refresh wired shared inventory: "..tostring(err); break
+        end
+        local from=coalSlot(items,tried)
+        if not from then break end
+        tried[from]=true
+        local d=items[from]
+        if dock.detail then
+            local detail,detailErr=dock.call("getItemDetail",from)
+            if not detailErr then d=detail end
+        end
+        if d and d.name==COAL_BLOCK then
+            local moved,pushErr=dock.call("pushItems",dock.id,from,1,into)
+            if verifyStationBuffer(into) then return true end -- burn before another transfer
+            if pushErr then
+                problem="Wired transfer failed; check writable turtle inventory: "..pushErr; break
+            end
+            if moved~=0 then
+                local message="Wired transfer reported success without delivery to station fuel slot "..into
+                announce("recovery_required",message,"station_transfer_unverified")
+                error(message,0)
+            end
+            problem="Coal was listed but not extracted; check storage extraction or compaction"
+        end
+    end
+    s.stationFuelSlot=nil; commit(s)
+    return false,problem,"station_fuel_rejected"
 end
 
 local function stationStep(g)
@@ -332,63 +504,43 @@ local function stationStep(g)
         assert(locate()==pos(),"GPS cannot verify the service bay")
         s.bayVerified=true; commit(s)
     end
-    local slot
-    for i=1,16 do if turtle.getItemCount(i)>0 then slot=i; break end end
-    if slot then
-        local present,_,paused=inspect("")
-        if paused then return end
-        if not present or not peripheral.hasType("front","inventory") then
-            announce("waiting_output","Shared station output inventory is missing","station_output_missing")
-            sleep(5); return
-        end
-        announce("unloading","Unloading at shared station")
-        turtle.select(slot)
-        turtle.drop()
-        turtle.select(1)
-        if turtle.getItemCount(slot)>0 then
-            announce("waiting_output","Shared station output is full or rejects cargo","station_output_full")
-            sleep(5)
-        end
-        return
-    end
     local limit=turtle.getFuelLimit()
+    local cap=limit=="unlimited" and math.huge or limit
     local distance=#g.route-1
-    local target=limit=="unlimited" and math.huge or math.min(limit,station.fuelTarget+distance)
-    if fuel()>=target then s.returning=true; s.stationComplete=true; commit(s); return end
-    local present,_,paused=inspect("Up")
+    local target=math.min(cap,station.fuelTarget+distance)
+    carried(target)
+    local present,_,paused=inspect("")
     if paused then return end
-    if not present or not peripheral.hasType("top","inventory") then
-        announce("waiting_fuel","Shared station coal-block inventory is missing","station_fuel_missing")
+    if not present or not peripheral.hasType("front","inventory") then
+        announce("waiting_output","No adjacent inventory capability in front of the shared bay","station_output_missing")
         sleep(5); return
     end
-    local items=peripheral.call("top","list")
-    local available=false
-    for _,d in pairs(items) do
-        if d.name~="minecraft:coal_block" then
-            announce("waiting_fuel","Station fuel inventory must contain only coal blocks","station_fuel_contaminated")
-            sleep(5); return
+    local hasCargo,dropWhy
+    for i=1,16 do
+        local count=turtle.getItemCount(i)
+        if count>0 then
+            hasCargo=true
+            if not peripheral.hasType("front","inventory") then
+                announce("waiting_output","Shared inventory disappeared; cargo retained","station_output_missing")
+                sleep(5); return
+            end
+            announce("unloading","Unloading at shared station")
+            turtle.select(i)
+            local _,why=turtle.drop()
+            turtle.select(1)
+            if turtle.getItemCount(i)<count then return end
+            dropWhy=why or "shared inventory is full or rejects cargo"
         end
-        available=true
     end
-    if not available then
-        announce("waiting_fuel","Shared station is out of coal blocks","station_fuel_empty")
-        sleep(5); return
+    if not hasCargo and fuel()>=target then
+        s.returning=true; s.stationComplete=true; commit(s); return
     end
-    for i=1,16 do if turtle.getItemCount(i)==0 then slot=i; break end end
-    if not slot then
-        announce("waiting_fuel","No empty inventory slot for a station coal block","station_fuel_no_slot")
-        sleep(5); return
-    end
-    announce("refueling","Taking a coal block at shared station")
-    s.stationFuelSlot=slot; commit(s)
-    turtle.select(slot)
-    local ok=turtle.suckUp(1)
-    assert(not ok or turtle.getItemCount(slot)>0,"Station fuel arrived outside the saved fuel slot")
-    settleStationFuel()
-    if not ok then
-        announce("waiting_fuel","Station fuel inventory rejected extraction","station_fuel_rejected")
-        sleep(5)
-    end
+    local ok,why,reason=stationPull(cap,target)
+    if ok or reason=="guard_wait" then return end
+    if hasCargo then
+        announce("waiting_output",dropWhy.."; "..why,"station_output_full")
+    else announce("waiting_fuel",why,reason) end
+    sleep(5)
 end
 
 local function request(kind,fields)
@@ -446,6 +598,7 @@ local function checkTrail()
 end
 checkTrail()
 reconcile()
+turtle.select(1)
 s.boot=s.boot+1
 commit(s)
 M.openModem()
@@ -483,16 +636,20 @@ while true do
             end
             s.request=nil; commit(s)
             if reply.reason then
+                if reply.reason=="station_fuel_reserve" then
+                    local cap=turtle.getFuelLimit()
+                    if type(cap)=="number" then carried(math.min(fuel()+1,cap)) end
+                end
                 announce("waiting_swarm",waiting[reply.reason] or "No reachable unclaimed patch with current route and fuel",reply.reason)
                 sleep(5)
             end
         end
     elseif not s.grant then
         assert(pos()==s.stage and s.heading==heading and locate()==s.stage,"not at verified staging")
-        service()
+        if not c.sharedStation then service() end
         local level=turtle.getFuelLevel()
         local tried=s.lastStationFuel==level
-        if c.sharedStation and (cargoSlot() or not emptySlot()
+        if c.sharedStation and (cargoSlot()
                 or (not tried and (s.needsStationFuel or fuel()<serviceBelow))) then
             request("service",{fuel=level})
         elseif not emptySlot() then
@@ -502,9 +659,10 @@ while true do
     elseif not verifiedGrant then
         if sync() then verifiedGrant=true
         else announce("waiting_swarm","Cannot verify saved assignment; holding position","coordinator_unreachable"); sleep(2) end
+    elseif s.stationFuelSlot then
+        settleStationFuel()
     else
         local g=s.grant
-        if s.stationFuelSlot then settleStationFuel() end
         local connected=not s.returning and sync()
         if not connected and not s.returning then s.returning=true; commit(s) end
         if not s.returning and ((#s.trail==1 and fuel()<g.fuelNeed)
