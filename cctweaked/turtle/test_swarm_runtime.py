@@ -261,7 +261,16 @@ local function ledger(id,dir)
     return latest and decode(assert(latest:match("\n(.*)$")))
 end
 local function snapshot(id) return ledger(id,"%.chunk_dig_swarm") end
-local function queue() return ledger(COORD,"%.chunk_dig_swarm_coordinator") end
+local Queue=load(SOURCES["/swarm_patch_queue.lua"],"queue","t",_ENV)()
+local function queue()
+    local raw=ledger(COORD,"%.chunk_dig_swarm_coordinator")
+    return raw and Queue.unpack(raw)
+end
+-- True once every chunk of layer y is mined or blocked.
+local function layerDone(s,y)
+    for _,e in ipairs(s.layers[y]) do if e:find("u",1,true) then return false end end
+    return true
+end
 local function setup(stage,work,station,approach)
     local c={quarryId="test",manifestId="immutable",dimension="overworld",staging=stage,
         clearApproach=approach or stage,work=work,patchSize=1,margin=1,allowAnyWorker=true,station=station}
@@ -486,16 +495,17 @@ function station_stops_on_unexpected_delivery()
 end
 
 -- Zero-config fixture: bay 0,0,0; the first turtle faces north, so the quarry
--- is x=0..15, z=-15..0 below the bay. Barrel behind (south), wired dock above.
+-- is x=0..16n-1, z=-(16n-1)..0 below the bay. Barrel behind (south), wired dock above.
 local BAY,BARREL,DOCK="0,0,0","0,0,1","0,1,0"
-local function autoFixture(bottom)
+local function autoFixture(bottom,chunks)
+    local w=16*(chunks or 1)
     files[COORD],dirs[COORD],inbox[COORD]={},{},{}
     launch(COORD,coordinator)
     drive(function() return #hosts>0 end)
     world[BARREL],world[DOCK]="minecraft:barrel","computercraft:wired_modem_full"
     inventories[BARREL]={items={[1]={name="minecraft:coal_block",count=64}}}
     docks[DOCK]={online=true,storage=inventories[BARREL]}
-    for x=0,15 do for z=-15,0 do for y=bottom,-1 do world[key(x,y,z)]="minecraft:stone" end end end
+    for x=0,w-1 do for z=-(w-1),0 do for y=bottom,-1 do world[key(x,y,z)]="minecraft:stone" end end end
 end
 local function place(id,h,fuel)
     assert(not at(BAY),"bay occupied")
@@ -522,6 +532,11 @@ local function parkedAt(id,p)
     return snap and not dirs[id]["/.chunk_dig_swarm_setup"] and not snap.grant
         and key(robots[id].x,robots[id].y,robots[id].z)==p and snap.stage==p
 end
+-- Parked at whichever parking cell the coordinator gave it.
+local function parkedOwn(id)
+    local s=queue()
+    return s and s.parked[id] and parkedAt(id,s.parked[id])
+end
 local function joinWhenFree(id,h)
     drive(function() return bayFree() and staged()>=id end,60000)
     place(id,h,0)
@@ -529,13 +544,13 @@ local function joinWhenFree(id,h)
 end
 
 function auto_define_join_and_finish_layer()
-    autoFixture(-1)
+    autoFixture(-1,2)
     place(1,0,0)
-    launch(1,worker,"new","1","-1")
+    launch(1,worker,"new","2","-1")
     drive(function() return snapshot(1) and staged()>=3 end,60000)
     local q=queue()
     assert(q.auto.definer==1 and q.auto.heading==0 and q.station.facing=="south")
-    assert(q.box.x0==0 and q.box.x1==15 and q.box.z0==-15 and q.box.z1==0 and q.box.y0==-1)
+    assert(q.box.x0==0 and q.box.x1==31 and q.box.z0==-31 and q.box.z1==0 and q.box.y0==-1 and q.box.n==2)
     assert(q.parked[1]=="0,-1,-1" and inventories[BARREL].taken>=1)
     assert(not dirs[1]["/.chunk_dig_swarm_setup"])
     assert(files[1]["/startup.lua"]:find('shell.execute("/chunk_dig_swarm","auto")',1,true))
@@ -545,16 +560,27 @@ function auto_define_join_and_finish_layer()
     assert(first[1]=="0,-1,0" and first[2]=="0,-1,-1")
     -- Turtle 2 is placed facing east, with no fuel; it finds the barrel itself.
     joinWhenFree(2,1)
-    drive(function() return parkedAt(2,"1,-1,-1") end,60000)
-    assert(robots[2].h==0 and queue().parked[2]=="1,-1,-1")
+    drive(function() return parkedOwn(2) end,60000)
+    assert(robots[2].h==0 and queue().parked[2]~="0,-1,-1")
     -- Turtle 3 faces west.
     joinWhenFree(3,3)
-    drive(function() return parkedAt(3,"2,-1,-1") end,60000)
+    drive(function() return parkedOwn(3) end,60000)
+    -- Every mining assignment covers one chunk, and no two run in the same chunk.
+    local maxActive=0
     drive(function()
         local s=queue()
-        return s.layers[-1]=="c" and next(s.active)==nil
-    end,400000)
-    for x=0,15 do for z=-15,0 do assert(not world[key(x,-1,z)],"left stone at "..key(x,-1,z)) end end
+        local seen,n={},0
+        for _,g in pairs(s.active) do
+            if g.chunk then
+                assert(not seen[g.chunk.k],"two assignments in chunk "..g.chunk.k)
+                seen[g.chunk.k]=true; n=n+1
+            end
+        end
+        maxActive=math.max(maxActive,n)
+        return layerDone(s,-1) and next(s.active)==nil
+    end,800000)
+    assert(maxActive>=2,"turtles never worked in parallel")
+    for x=0,31 do for z=-31,0 do assert(not world[key(x,-1,z)],"left stone at "..key(x,-1,z)) end end
     local dug={}
     for _,e in ipairs(events) do
         if e.op=="dig" then assert(not dug[e.p],"dug twice "..e.p); dug[e.p]=true end
@@ -592,9 +618,9 @@ function auto_define_survives_reboot_and_lost_reply()
 end
 
 function auto_join_recovers_mid_route()
-    autoFixture(-1)
+    autoFixture(-1,2)
     place(1,0,0)
-    launch(1,worker,"new","1","-1")
+    launch(1,worker,"new","2","-1")
     drive(function() return snapshot(1) and staged()>=2 end,60000)
     drive(function() return bayFree() end,60000)
     place(2,2,0)
@@ -602,7 +628,8 @@ function auto_join_recovers_mid_route()
     launch(2,worker)
     drive(function() return jobs[2].cut end,60000)
     local snap=snapshot(2)
-    assert(snap.grant.relocate and snap.stationComplete and snap.stage=="1,-1,-1")
+    local park=snap.stage
+    assert(snap.grant.relocate and snap.stationComplete and park~="0,-1,-1" and queue().parked[2]==park)
     local taken=inventories[BARREL].taken
     jobs[COORD],inbox[COORD]=nil,{}
     inbox[2]={}
@@ -612,7 +639,7 @@ function auto_join_recovers_mid_route()
     -- Without the coordinator it cannot verify the grant, so it holds still.
     assert(robots[2].x==1 and robots[2].z==0 and queue().active[2])
     launch(COORD,coordinator)
-    drive(function() return parkedAt(2,"1,-1,-1") end,60000)
+    drive(function() return parkedAt(2,park) end,60000)
     assert(inventories[BARREL].taken>=taken and robots[2].h==0 and robots[2].fuel>=900)
 end
 
@@ -645,10 +672,35 @@ local function pickUp(id)
     robots[id],jobs[id],inbox[id]=nil,nil,{}
 end
 
+-- Start a turtle sitting in the bay. If a working turtle reserved the bay
+-- for a service trip first, the newcomer is refused and lifted out, as a
+-- player would, then placed back once the bay is free.
+local function joinRetry(id,h,mode)
+    for _=1,5 do
+        launch(id,worker,mode)
+        drive(function() return parkedOwn(id) or jobs[id]==nil end,60000)
+        if parkedOwn(id) then return end
+        local d,f=dirs[id],files[id]
+        pickUp(id)
+        drive(function()
+            local s=queue()
+            local taken={}
+            for _,p in pairs(s.parked) do taken[p]=true end
+            local open=false
+            for _,p in ipairs(s.auto.park) do if s.staging[p] and not taken[p] then open=true end end
+            return open and bayFree()
+        end,400000)
+        place(id,h,0)
+        dirs[id],files[id]=d,f
+        mode=nil
+    end
+    error("join never succeeded")
+end
+
 function auto_newcomer_picked_up_before_leaving_bay()
-    autoFixture(-2)
+    autoFixture(-2,2)
     place(1,0,0)
-    launch(1,worker,"new","1","-2")
+    launch(1,worker,"new","2","-2")
     drive(function() return snapshot(1) and staged()>=2 end,60000)
     drive(function() return bayFree() end,60000)
     place(2,2,0)
@@ -664,14 +716,11 @@ function auto_newcomer_picked_up_before_leaving_bay()
     -- Turtle 3 goes in the bay; that cancels turtle 2's join.
     place(3,1,0)
     launch(3,worker)
-    drive(function() return parkedAt(3,"1,-1,-1") end,60000)
+    drive(function() return parkedOwn(3) end,60000)
     local q=queue()
     assert(q.revoked[2]==revokedId and not q.active[2] and not q.parked[2])
     -- Turtle 1 can use the bay again, and the layer gets finished.
-    drive(function()
-        local s=queue()
-        return s.layers[-1]=="c"
-    end,600000)
+    drive(function() return layerDone(queue(),-1) end,800000)
     -- Turtle 2 put back later forgets its cancelled join and does not move.
     drive(function() return bayFree() end,60000)
     place(2,2,0)
@@ -682,14 +731,13 @@ function auto_newcomer_picked_up_before_leaving_bay()
     assert(not dirs[2]["/.chunk_dig_swarm"] and robots[2].moves==0)
     -- Running it again joins normally.
     inbox[2]={}
-    launch(2,worker)
-    drive(function() local s=snapshot(2); return s and s.auto and queue().parked[2] end,6000)
+    joinRetry(2,2)
 end
 
 function auto_newcomer_put_back_resumes()
-    autoFixture(-1)
+    autoFixture(-1,2)
     place(1,0,0)
-    launch(1,worker,"new","1","-1")
+    launch(1,worker,"new","2","-1")
     drive(function() return snapshot(1) and staged()>=2 end,60000)
     drive(function() return bayFree() end,60000)
     place(2,2,0)
@@ -702,12 +750,13 @@ function auto_newcomer_put_back_resumes()
     drive(function() return clock>start+30 end)
     robots[2]=r
     launch(2,worker)
-    drive(function() return parkedAt(2,"1,-1,-1") end,60000)
+    drive(function() return parkedOwn(2) end,60000)
+    local park=queue().parked[2]
     assert(not queue().revoked or not queue().revoked[2])
     printed={}
     launch(2,worker,"status")
     drive(function() return jobs[2]==nil end)
-    assert(printed[1]:find("assignment none | saved 1,-1,-1 heading 0 (north)",1,true),printed[1])
+    assert(printed[1]:find("assignment none | saved "..park.." heading 0 (north)",1,true),printed[1])
     printed={}
     robots[9]={x=5,y=5,z=5,h=0,fuel=0,digs=0,moves=0,turns=0,items={},slot=1}
     files[9],dirs[9],inbox[9]={},{},{}
@@ -717,9 +766,9 @@ function auto_newcomer_put_back_resumes()
 end
 
 function auto_newcomer_picked_up_during_setup_rejoins()
-    autoFixture(-2)
+    autoFixture(-2,2)
     place(1,0,0)
-    launch(1,worker,"new","1","-2")
+    launch(1,worker,"new","2","-2")
     drive(function() return snapshot(1) and staged()>=2 end,60000)
     drive(function() return bayFree() end,60000)
     place(2,2,0)
@@ -731,25 +780,45 @@ function auto_newcomer_picked_up_during_setup_rejoins()
     pickUp(2)
     place(3,1,0)
     launch(3,worker)
-    drive(function() return parkedAt(3,"1,-1,-1") end,60000)
+    drive(function() return parkedOwn(3) end,60000)
     assert(queue().revoked[2])
     drive(function() return bayFree() end,60000)
     place(2,2,0)
     dirs[2],files[2]=keepDirs,keepFiles
-    launch(2,worker,"auto") -- the unfinished setup asks again and gets a new spot
-    drive(function() return parkedAt(2,"2,-1,-1") end,60000)
-    assert(not queue().revoked[2])
+    joinRetry(2,2,"auto") -- the unfinished setup asks again and gets a new spot
+    assert(not queue().revoked[2] and queue().parked[2]~=queue().parked[3])
 end
 
 function auto_define_refused_when_coordinator_disk_is_too_small()
     autoFixture(-1)
     FREE=100000
     place(1,0,0)
-    launch(1,worker,"new","8","-64")
+    launch(1,worker,"new","9","-64")
     local ok,why=pcall(drive,function() return jobs[1]==nil end,60000)
     assert(not ok and tostring(why):find("Coordinator disk too small",1,true),tostring(why))
     assert(not dirs[1]["/.chunk_dig_swarm_setup"] and not dirs[1]["/.chunk_dig_swarm"] and not queue())
     FREE=1000000
+end
+
+function auto_low_coordinator_disk_pauses_claims()
+    autoFixture(-1)
+    place(1,0,0)
+    launch(1,worker,"new","1","-1")
+    drive(function() return snapshot(1) and queue().replay[1].kind=="claim" end,60000)
+    FREE=10000
+    drive(function()
+        local r=queue().replay[1]
+        return r.kind=="claim" and r.reason=="coordinator_disk"
+    end,200000)
+    local before=0
+    for _,e in ipairs(events) do if e.op=="dig" then before=before+1 end end
+    local start=clock
+    drive(function() return clock>start+60 end)
+    local after=0
+    for _,e in ipairs(events) do if e.op=="dig" then after=after+1 end end
+    assert(after==before and not queue().active[1],"worked while the coordinator disk was low")
+    FREE=1000000
+    drive(function() return layerDone(queue(),-1) and next(queue().active)==nil end,400000)
 end
 '''
 
@@ -827,6 +896,8 @@ class SwarmRuntimeTests(unittest.TestCase):
 
     def test_zero_config_define_refused_when_coordinator_disk_is_too_small(self):
         self.lua.globals().auto_define_refused_when_coordinator_disk_is_too_small()
+    def test_zero_config_low_coordinator_disk_pauses_claims(self):
+        self.lua.globals().auto_low_coordinator_disk_pauses_claims()
 
 
 if __name__ == "__main__":

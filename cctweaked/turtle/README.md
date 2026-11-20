@@ -293,8 +293,8 @@ wget https://raw.githubusercontent.com/tucker19/minecraft_scripts/main/cctweaked
 ### Kick it off
 
 1. Dashboard computer: `swarm_coordinator`. It waits for the first turtle. To keep the dashboard on the same computer, run `bg swarm_coordinator` and then start `turtle_wireless_dash` as usual.
-2. First turtle, in the bay facing the quarry: `chunk_dig_swarm new 1`. The number is the chunk width (1 to 8; the quarry is that many chunks on each side). The coordinator refuses sizes its disk cannot hold, see Size limits below. An optional second number sets the bottom Y (default `-64`), for example `chunk_dig_swarm new 2 10`.
-3. Every later turtle: place it in the bay, in any facing and with no fuel, and run `chunk_dig_swarm`. It finds the barrel by turning in place, unloads and refuels from the barrel, drives the lane to the next free parking spot, and starts mining. Add one turtle at a time. If the bay is busy, or no parking spot has been dug yet, it says so and does nothing: lift it out and try again shortly.
+2. First turtle, in the bay facing the quarry: `chunk_dig_swarm new 1`. The number is the chunk width (1 to 9; the quarry is that many chunks on each side, so 9 is a 9x9-chunk quarry). It also sets the turtle limit: one turtle per chunk. The coordinator refuses sizes its disk cannot hold, see Size limits below. An optional second number sets the bottom Y (default `-64`), for example `chunk_dig_swarm new 2 10`.
+3. Every later turtle: place it in the bay, in any facing and with no fuel, and run `chunk_dig_swarm`. It finds the barrel by turning in place, unloads and refuels from the barrel, drives the lane to the next free parking spot, and starts mining. Add one turtle at a time. If the bay is busy, or no parking spot has been dug yet, it says so and does nothing: lift it out and try again shortly. Once every chunk has a turtle, it says the quarry is full.
 
 What the first turtle does: it checks GPS, the barrel behind it, and the wired dock. If its fuel is under 100, it takes coal blocks from the barrel. It then digs and moves one block down and one block forward, without turning, so GPS reveals its facing. It reports the bay, facing, and chunk count to the coordinator, which builds the quarry ledger. That second cell becomes its parking spot. The turtle never treats a later position as a new home.
 
@@ -333,16 +333,17 @@ Use this when a turtle stopped with a message about a pending turn or move, or y
 ### Running notes
 
 - Each turtle keeps its own parking spot as home and uses the bay one at a time, the same way standalone does. At the bay it burns carried coal blocks, unloads cargo, and pulls single coal blocks through the wired dock. It visits the bay when it has cargo, when fuel is below 800, or when a reachable patch needs more fuel.
-- Parking is limited to the dug parking row: 16 spots per chunk width, up to 64.
+- Work is handed out one chunk at a time. Each assignment is one layer of one chunk (up to 256 blocks), taken from that chunk's highest unfinished layer, so each chunk is mined layer by layer like `chunk_dig`. Two turtles never work in the same chunk at once. A block is only assigned once the block above it is mined or blocked, so gravel and sand never fall into cleared space.
+- Parking: one spot per chunk, in the row under the bay, spread so each 16-wide band of chunks has its own spots.
 
 ### Size limits
 
 These are limits of this script, not of CC:Tweaked.
 
-- Disk: the coordinator saves the whole quarry map, one character per block for every layer that is partly mined, and keeps two saved copies plus one being written. Before accepting `new`, it checks the worst case (3 x layers x width squared, plus 256 KB) against its free disk space and refuses if it does not fit. On the default 1 MB computer, a quarry from about y=70 down to -64 fits at 1 or 2 chunks, not 3 or more. A server with a larger `computer_space_limit` allows more.
-- Speed: each assignment searches outward through the cleared space, so it slows as the quarry grows. In offline tests at 8 chunks it rose from about 45 ms to over 400 ms in plain Lua after 800 assignments; in game it is slower.
-- Parking: one row along the quarry edge, 16 spots per chunk width, capped at 64. All turtles share one bay, so beyond a handful of turtles extra ones mostly queue for the bay.
-- Chunks: 8 at most, which keeps the map validation and route sizes bounded.
+- Disk: the coordinator saves the quarry map compactly: an untouched or finished chunk layer is one character, and a partly mined one is stored as runs (for example `c40u216`) or 4 blocks per character, whichever is shorter. It keeps two saved copies plus one being written. Before accepting `new`, it checks a realistic estimate against its free disk space and refuses if it does not fit; a full 9x9 quarry from y=70 down to -64 needs about 715 KB by that estimate, under the default 1 MB. While running, it stops handing out new work (`coordinator_disk`) if free space drops below twice the last save plus 64 KB, and turtles wait at parking. Returning and finishing still work.
+- Speed: assignments search only the top layer and the target chunk, so they stay small as the quarry grows. In an offline simulation of a full 9x9 quarry from y=70 to -64 (81 turtles, 2.78 million blocks, about 12,500 assignments), the largest saved ledger was 152 KB (about 460 KB on disk with the extra copies), assignments averaged 65 ms with a worst case of 0.6 s, and finishes averaged 51 ms. That was plain Lua on a PC; CC:Tweaked's Lua is slower, so expect several times longer in game.
+- Turtles: one per chunk, so 81 at 9 chunks. All turtles share one bay, so with many turtles most of the waiting is for the bay.
+- Chunks: 9 at most.
 - When nothing reachable remains, turtles wait at parking with `no_safe_patch`. Bedrock and protected Allthemodium ores stay blocked, and cells that cannot be entered are reported as blocked or unverified, never as cleared.
 - The dashboard shows the swarm job, assigned area (including `moving to parking`), and waiting reason alongside normal telemetry.
 - Do not change the bay layout or start another coordinator during a quarry. To start a new quarry, let all turtles park, stop everything, delete `/.chunk_dig_swarm_coordinator` on the dashboard computer and `/.chunk_dig_swarm` on each turtle, then repeat the kick-off steps. The swarm never opens a standalone `/.chunk_dig` job.

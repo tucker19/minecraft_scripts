@@ -149,6 +149,7 @@ local function report(force)
         swarm={quarryId=s.quarryId,assignmentId=s.grant and s.grant.id,
             area=s.grant and (s.grant.relocate and ("moving to parking "..s.stage)
                 or s.grant.station and ("service bay "..s.grant.route[#s.grant.route])
+                or s.grant.chunk and ("chunk "..s.grant.chunk.k.." layer "..s.grant.chunk.y..": "..#s.grant.cells.." cells")
                 or (s.grant.cells[1].." +"..(#s.grant.cells-1).." cells")),
             waitingReason=reason}
     },M.telemetry)
@@ -767,7 +768,8 @@ end
 local joinWait={
     bay_busy="Another turtle is using the bay. Lift this one out and try again in a moment.",
     lane_busy="The bay lane is in use. Try again in a moment.",
-    no_parking="No free parking cell yet; the swarm digs more as it works. Try again later."
+    no_parking="No free parking cell yet; the swarm digs more as it works. Try again later.",
+    swarm_full="This quarry already has one turtle per chunk; no more can join"
 }
 local function setupJoin()
     local here=assert(locate(),"GPS unavailable")
@@ -801,8 +803,8 @@ end
 
 if mode=="new" then
     local chunks,bottom=tonumber(choice),tonumber(extra or "-64")
-    if not (chunks and chunks%1==0 and chunks>=1 and chunks<=8) then
-        error("Usage: chunk_dig_swarm new <chunks 1-8> [bottomY]",0)
+    if not (chunks and chunks%1==0 and chunks>=1 and chunks<=9) then
+        error("Usage: chunk_dig_swarm new <chunks 1-9> [bottomY]",0)
     end
     if not (bottom and bottom%1==0) then error("bottomY must be a whole number",0) end
     if fs.exists(DIR) then error("Saved swarm state exists; run chunk_dig_swarm resume",0) end
@@ -918,7 +920,8 @@ local waiting={
     station_busy="Shared bay or its route is reserved; waiting at staging",
     join_pending="A new turtle that joined has not left the bay. If it was picked up, place any turtle in the bay and run chunk_dig_swarm",
     station_fuel_reserve="Add starter fuel at staging; not enough for a round trip to the shared bay",
-    patch_fuel="Not enough fuel for the reachable patch and the required return reserve"
+    patch_fuel="Not enough fuel for the reachable patch and the required return reserve",
+    coordinator_disk="Coordinator disk is nearly full; no new work until space is freed"
 }
 while true do
     if s.request then

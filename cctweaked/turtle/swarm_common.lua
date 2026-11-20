@@ -74,7 +74,9 @@ function M.store(dir,initialize)
     else
         assert(gen>0,"swarm store has no committed snapshot")
         assert(gen==1 or fs.exists(path(gen-1)),"previous swarm generation is missing")
-        state=decode(read(path(gen)),gen)
+        local blob=read(path(gen))
+        M.lastCommitSize=#blob
+        state=decode(blob,gen)
         if gen>1 then decode(read(path(gen-1)),gen-1) end
     end
     local function commit(value)
@@ -85,6 +87,7 @@ function M.store(dir,initialize)
         local tmp=path(n)..".tmp"
         local f=assert(fs.open(tmp,"w"))
         f.write(blob); f.close()
+        M.lastCommitSize=#blob
         assert(read(tmp)==blob,"swarm staged write failed verification")
         fs.move(tmp,path(n))
         gen=n

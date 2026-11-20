@@ -141,7 +141,7 @@ if not state then
             end
             if ok then
                 local _,save=M.store(STATE,true)
-                save(built)
+                save(Queue.pack(built))
                 state,commit=built,save
                 c={quarryId=built.quarryId,manifestId=built.manifestId,dimension=built.dimension}
                 print("Quarry defined by turtle "..sender..": "..m.chunks.." chunk(s) from "..m.bay)
@@ -186,6 +186,10 @@ while true do
     elseif request(m) and M.sameJob(c,m) and type(m.stage)=="string" and authorized(sender,m.stage) then
         local result,why
         if m.kind=="claim" then
+            -- Safety net: stop handing out new work before the ledger can no
+            -- longer be written. Finishes and service trips still go through.
+            local free=fs.getFreeSpace and fs.getFreeSpace("/")
+            q.diskLow=type(free)=="number" and free<2*(M.lastCommitSize or 0)+65536
             result,why=q:claim(sender,m.seq,m.stage,m.fuel)
         elseif m.kind=="service" then
             result,why=q:service(sender,m.seq,m.stage,m.fuel)
