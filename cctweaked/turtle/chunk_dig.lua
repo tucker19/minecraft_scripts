@@ -1,10 +1,14 @@
--- chunk_dig <chunks> [job name] [north|east|south|west]
--- chunk_dig archive | new <chunks> [job name] [north|east|south|west]
+-- chunk_dig <chunks> [job name] [north|east|south|west] [--find-floor]
+-- chunk_dig archive | new <chunks> [job name] [north|east|south|west] [--find-floor]
 -- chunk_dig resume | auto | status | resolve <generation> <before|after>
 -- chunk_dig migrate-shared  (existing back/top job, safely stopped at home)
 -- Stand at the original base to start. The first mined layer is below home.
+-- --find-floor (new jobs only, asks for confirmation): drop down the starting
+-- column through air and start the quarry at the first diggable block found,
+-- at most MAX_FIND_DEPTH blocks below home. Only that column is checked.
 local OUTPUT_SIDE = "back"
 local FUEL_SIDE = "back"
+local MAX_FIND_DEPTH = 384
 local SAFETY_MARGIN = 32
 local MIN_PROGRESS = 64
 local RETRY_SECONDS = 5
@@ -107,7 +111,8 @@ local function telemetry(force)
         reserve=fuel() == math.huge and 0 or reserve,
         job={chunks=s.chunks, side=side, area=side and side*side, layer=s.layer,
             layerCleared=c.count, layerBlocked=c.nblocked, layerSkipped=c.skipped,
-            regions=c.regions and #c.regions, cells=s.total, trips=s.trips},
+            regions=c.regions and #c.regions, cells=s.total, trips=s.trips,
+            findFloor=s.findFloor and s.findFloor.maxDepth or nil, firstLayer=s.firstLayer},
         inventory={usedSlots=used,totalSlots=16,emptySlots=16-used,items=items,percent=100*used/16},
         location={relative=verifiedPose and s.pos or nil,
             heading=verifiedPose and s.pos.h or nil, uncertain=not verifiedPose,
@@ -335,17 +340,24 @@ local function validateState(r)
         or type(s.lastFuel) ~= "string" or type(s.tasks) ~= "table"
         or (s.done ~= true and s.done ~= false)
         or (s.result ~= nil and type(s.result) ~= "boolean")
-        or (s.anchor and (not validWorld(s.anchor) or not integer(s.anchor.h,0,3))) then
+        or (s.anchor and (not validWorld(s.anchor) or not integer(s.anchor.h,0,3)))
+        or (s.findFloor~=nil and (type(s.findFloor)~="table" or not integer(s.findFloor.maxDepth,1,4096)))
+        or (s.firstLayer~=nil and (not s.findFloor or not integer(s.firstLayer,1,s.findFloor.maxDepth+1)))
+        or (s.findFloor and s.layer>0 and s.firstLayer==nil) then
         recovery("Checkpoint metadata is invalid or belongs to another turtle")
     end
     side = s.chunks*16
     unpackJob(s)
+    -- A find-floor job starts mining at firstLayer; layers above it were
+    -- skipped, so the first mined layer has no parent layer.
+    local first=s.firstLayer or 1
     if not validPoint(s.home,true) or not same(s.home,HOME) or s.home.h~=0
         or not validPoint(s.pos,true)
         or (s.layer == 0 and (s.cur ~= nil or s.par ~= nil))
+        or (s.layer > 0 and s.layer < first)
         or (s.layer > 0 and not verifyLayer(s.cur,s.layer))
-        or (s.layer < 2 and s.par ~= nil)
-        or (s.layer >= 2 and not verifyLayer(s.par,s.layer-1))
+        or (s.layer < first+1 and s.par ~= nil)
+        or (s.layer >= first+1 and not verifyLayer(s.par,s.layer-1))
         or (s.done and (#s.tasks ~= 0 or not same(s.pos,HOME) or s.pos.h ~= 0))
         or (not s.done and (#s.tasks < 1 or #s.tasks > 16
             or type(s.tasks[1]) ~= "table" or s.tasks[1].kind ~= "job")) then
@@ -354,6 +366,8 @@ local function validateState(r)
     for i,t in ipairs(s.tasks) do
         if not validTask(t,i) then recovery("Invalid checkpoint task at depth " .. i) end
         if t.sharedFuelSlot and s.output~=s.fuel then recovery("Invalid shared fuel buffer") end
+        if t.kind=="floor" and (not s.findFloor or i~=2 or s.layer~=0
+            or #t.path-1>s.findFloor.maxDepth) then recovery("Invalid find-floor search record") end
     end
     local t=s.tasks[#s.tasks]
     if t then
@@ -363,7 +377,15 @@ local function validateState(r)
         elseif t.kind=="mine" then
             if (t.moved and (t.mode=="below" or not same(t.p,s.pos)))
                 or (not t.moved and not adjacent(t.p,s.pos)) then recovery("Mine target disagrees with saved pose") end
-        elseif t.kind=="base" and not same(s.pos,HOME) then recovery("Base step has non-home pose") end
+        elseif t.kind=="base" and not same(s.pos,HOME) then recovery("Base step has non-home pose")
+        elseif t.kind=="floor" then
+            local e=t.path[#t.path]
+            local below=point(0,e.y-1,0)
+            local ok=(t.stage=="stopped" and same(s.pos,HOME))
+                or (t.stage=="search" and same(s.pos,t.moved and below or e))
+                or (t.stage=="land" and (same(s.pos,e) or same(s.pos,below)))
+            if not ok then recovery("Find-floor position disagrees with the saved descent route") end
+        end
     end
 end
 local function readState()
@@ -387,7 +409,9 @@ local function readState()
         if new.created~=old.created or new.chunks~=old.chunks or new.output~=old.output
             or (new.fuel~=old.fuel and not migrated)
             or (old.barrel and new.barrel~=old.barrel)
-            or (new.sharedMigration~=old.sharedMigration and not migrated) then
+            or (new.sharedMigration~=old.sharedMigration and not migrated)
+            or (new.findFloor==nil)~=(old.findFloor==nil)
+            or (new.findFloor and new.findFloor.maxDepth~=old.findFloor.maxDepth) then
             recovery("Checkpoint copies belong to different jobs or configurations")
         end
     end
@@ -542,10 +566,11 @@ local function actionRecord()
     local a=afterPose(j.op,j.before)
     local move=j.op~="left" and j.op~="right"
     if not same(a,j.after) or a.h ~= j.after.h or #S.tasks ~= j.depth or task().kind ~= j.kind
-        or (move and j.kind ~= "walk" and j.kind ~= "mine") then recovery("Action and checkpoint disagree") end
+        or (move and j.kind ~= "walk" and j.kind ~= "mine" and j.kind ~= "floor") then recovery("Action and checkpoint disagree") end
     if move then
         local t=task()
-        local dest=t.kind=="walk" and t.path[t.i] or t.p
+        local dest=t.kind=="walk" and t.path[t.i]
+            or t.kind=="floor" and point(0,t.path[#t.path].y-1,0) or t.p
         if not dest or not same(dest,j.after) or t.mode=="below" then recovery("Journal has the wrong motion target") end
     end
     local before = same(S.pos,j.before) and S.pos.h == j.before.h
@@ -985,13 +1010,26 @@ local function routeFrom(c,x,z)
     if not path then fail("No cleared route to region entry") end
     return append(path,region.up)
 end
+-- During a find-floor search there is no mined layer yet. The only route
+-- home is the recorded descent column, back up to the original dock.
+local function floorTask()
+    for i=#S.tasks,1,-1 do if S.tasks[i].kind=="floor" then return S.tasks[i] end end
+end
+local function descentHome()
+    local f=floorTask()
+    if not f or not same(f.path[#f.path],S.pos) then fail("No recorded route home from the find-floor search") end
+    return reversed(f.path)
+end
 local function routeHome()
     local p=S.pos
-    return p.y==0 and {HOME} or routeFrom(S.cur,p.x,p.z)
+    if p.y==0 then return {HOME} end
+    if not S.cur then return descentHome() end
+    return routeFrom(S.cur,p.x,p.z)
 end
 local function homeCost()
     local p=S.pos
     if p.y==0 then return 0 end
+    if not S.cur then return #descentHome()-1 end
     local d,r=cellInfo(S.cur,p.x,p.z)
     return d+#S.cur.regions[r].up
 end
@@ -1348,13 +1386,112 @@ handlers.descend = function(t)
     t.x,t.z=xz(k); t.stage="dig"
     return push("gotoCell",{x=t.x,z=t.z})
 end
+-- Find-floor search. Each dispatch inspects below once and makes at most one
+-- journaled move. Only confirmed air ("No block to inspect") is entered.
+-- Liquids, protected blocks and uncertain results pause in place; a failed
+-- move is retried and is never taken as terrain or as quarry completion.
+local floorPause
+local function isLiquid(b)
+    local n=b.name
+    if n:find("water") or n:find("lava") or n:find("fluid") or n:find("liquid") then return true end
+    if type(b.state)=="table" and (b.state.level~=nil or b.state.waterlogged==true) then return true end
+    if type(b.tags)=="table" then
+        for tag in pairs(b.tags) do
+            local s=tostring(tag)
+            if s:find("water") or s:find("lava") or s:find("fluid") then return true end
+        end
+    end
+    return false
+end
+local function pauseFloor(why)
+    floorPause=why
+    announce("find_floor_paused",why)
+    sleep(S.retry)
+end
+handlers.floor = function(t)
+    if t.stage=="stopped" then
+        if not same(S.pos,HOME) then fail("Find-floor stop outside home") end
+        if not face(0) then return end
+        fail(("find-floor reached its %d-block search limit without finding a diggable block."
+            .. " The turtle is back at home and nothing was mined. Run chunk_dig archive to discard this job")
+            :format(S.findFloor.maxDepth))
+    end
+    local here=t.path[#t.path]
+    local depth=#t.path-1
+    if t.stage=="land" then
+        if result() then
+            -- Start the normal quarry at the floor block's level. The layer's
+            -- route home is the recorded descent column.
+            S.layer,S.firstLayer=depth,depth+1
+            newLayer(reversed(t.path)) -- S.layer becomes depth+1
+            floorPause=nil
+            return pop(true)
+        end
+        t.stage="search"
+        checkpoint()
+        pauseFloor("could not dig the block below at depth " .. depth .. "; rechecking")
+        return
+    end
+    if t.moved then
+        -- New table: saved routes are encoded once per table identity.
+        local path={}
+        for i,p in ipairs(t.path) do path[i]=p end
+        path[#path+1]=point(0,here.y-1,0)
+        t.path,t.moved=path,nil
+        return true
+    end
+    if not same(S.pos,here) then fail("Find-floor position disagrees with the saved descent route") end
+    local ok,present,b,waited=pcall(inspectTarget,"down")
+    if not ok then
+        if tostring(present):find("Terminated") then error(present,0) end
+        return pauseFloor("cannot inspect below at depth " .. depth .. ": " .. tostring(present))
+    end
+    if waited then floorPause=nil; return end
+    local below=point(0,here.y-1,0)
+    if present then
+        if type(b)~="table" or type(b.name)~="string" then
+            return pauseFloor("uncertain inspection result below at depth " .. depth)
+        end
+        if isLiquid(b) then
+            return pauseFloor("liquid below at depth " .. depth .. ": " .. b.name .. "; not treated as the floor")
+        end
+        if not canDig(below,b.name) then
+            return pauseFloor("protected block below at depth " .. depth .. ": " .. b.name .. "; not treated as the floor")
+        end
+        floorPause=nil
+        t.stage="land"
+        return pushMine(below,"normal")
+    end
+    if b~="No block to inspect" then
+        return pauseFloor("uncertain inspection result below at depth " .. depth .. ": " .. tostring(b))
+    end
+    floorPause=nil
+    if depth>=S.findFloor.maxDepth then
+        print("find-floor: still air below at the " .. S.findFloor.maxDepth .. "-block limit; returning home")
+        t.stage="stopped"
+        return pushWalk(reversed(t.path))
+    end
+    -- Fuel for this step plus the whole climb back, and the usual margin.
+    if budget(depth+2+S.margin) then return true end
+    local moved,why=motion("down")
+    if moved==false then afterFailedMove("down","Find-floor descent",why) end
+end
+
 handlers.job = function(t)
     if t.stage=="start" then
         t.stage="first"
         return push("base",{stage="validate_output",need=2*S.progress+S.margin})
     elseif t.stage=="first" then
+        if S.findFloor then
+            t.stage="found"
+            return push("floor",{stage="search",path={HOME}})
+        end
         t.stage="first_land"
         return pushMine(point(0,-1,0),"normal")
+    elseif t.stage=="found" then
+        if not result() then fail("Find-floor search ended without a starting layer") end
+        t.stage="layer"
+        return true
     elseif t.stage=="first_land" then
         if not result() then fail("Cannot dig below home") end
         newLayer({HOME}); t.stage="layer"
@@ -1383,7 +1520,8 @@ handlers.job = function(t)
 end
 
 local stages={
-    job={start=true,first=true,first_land=true,layer=true,below=true,descend=true,next=true,final=true,done=true},
+    job={start=true,first=true,first_land=true,found=true,layer=true,below=true,descend=true,next=true,final=true,done=true},
+    floor={search=true,land=true,stopped=true},
     base={validate_output=true,validate_fuel=true,invalid_base=true,unload=true,waiting_output=true,refuel=true,waiting_fuel=true,orient=true},
     service={out=true,at_base=true,back=true,restore=true},
     layer={sweep=true,find=true,island=true}, isolated={plan=true,down=true,land=true,retry=true,blocked=true},
@@ -1392,10 +1530,18 @@ local stages={
 validTask=function(t,i)
     if type(t)~="table" or not handlers[t.kind] or (t.kind=="job")~=(i==1)
         or (stages[t.kind] and not stages[t.kind][t.stage])
-        or (t.moved~=nil and (t.moved~=true or (t.kind~="walk" and t.kind~="mine")))
+        or (t.moved~=nil and (t.moved~=true or (t.kind~="walk" and t.kind~="mine" and t.kind~="floor")))
         or (t.sharedFuelSlot~=nil and (t.kind~="base" or not integer(t.sharedFuelSlot,1,16))) then return false end
     local k=t.kind
     if k=="walk" then return verifyRoute(t.path) and integer(t.i,2,#t.path+1) end
+    if k=="floor" then
+        -- The descent route is the starting column, from home downward.
+        if not verifyRoute(t.path) then return false end
+        for j,p in ipairs(t.path) do
+            if p.x~=0 or p.z~=0 or p.y~=1-j then return false end
+        end
+        return true
+    end
     if k=="mine" then return validPoint(t.p) and ({normal=true,isolated=true,below=true})[t.mode] end
     if k=="service" then return verifyRoute(t.path) and validPoint(t.saved,true)
         and same(t.path[1],t.saved) and same(t.path[#t.path],HOME) and type(t.reason)=="string"
@@ -1438,6 +1584,17 @@ local function reportPhase()
             return
         end
     end
+    local f=S.layer==0 and floorTask()
+    if f then
+        if f.stage=="stopped" then
+            if t.kind=="walk" then reserve=#t.path-t.i+1-(t.moved and 1 or 0)+S.margin end
+            announce("returning_home","find-floor search limit reached")
+        elseif not floorPause then
+            reserve=#f.path+S.margin
+            announce("finding_start_depth",("depth %d of max %d"):format(#f.path-1,S.findFloor.maxDepth))
+        end
+        return
+    end
     if S.tasks[1].stage=="final" then
         if t.kind=="walk" then reserve=#t.path-t.i+1-(t.moved and 1 or 0)+S.margin end
         announce("returning_home","finished at layer " .. S.layer)
@@ -1445,11 +1602,47 @@ local function reportPhase()
     else announce("starting","Preparing first layer") end
 end
 
+local FIND_FLOOR_WARNING={
+    "--find-floor: the turtle drops down its starting column through air and starts the",
+    "normal quarry at the first diggable block it finds, at most %d blocks below home.",
+    "WARNING: only the starting column is checked. This cannot prove the whole footprint",
+    "is empty. Blocks elsewhere in the footprint above that level are skipped and never mined.",
+}
+local function confirmFindFloor()
+    for _,line in ipairs(FIND_FLOOR_WARNING) do print(line:format(MAX_FIND_DEPTH)) end
+    write("Type yes to continue: ")
+    local answer=read()
+    if type(answer)~="string" or answer:lower()~="yes" then
+        fail("--find-floor not confirmed; no job was created or archived")
+    end
+end
+
 local function run()
+    -- Options are removed before positional parsing. They are validated
+    -- before any saved state is read, archived or created.
+    local findFloor=false
+    do
+        local kept={}
+        for i=1,#args do
+            local a=args[i]
+            if a=="--find-floor" then
+                if findFloor then fail("--find-floor was given more than once") end
+                findFloor=true
+            elseif type(a)=="string" and a:sub(1,2)=="--" then
+                fail("Unknown option " .. a .. "; run chunk_dig for usage")
+            else kept[#kept+1]=a end
+        end
+        for i=#args,1,-1 do args[i]=nil end
+        for i,a in ipairs(kept) do args[i]=a end
+    end
     local mode=args[1]
+    if findFloor and (not mode or ({archive=true,status=true,resume=true,auto=true,
+        resolve=true,["migrate-shared"]=true})[mode]) then
+        fail("--find-floor only applies when starting a new job: chunk_dig <chunks> ... --find-floor or chunk_dig new <chunks> ... --find-floor")
+    end
     if not mode then
-        print("Usage: chunk_dig <chunks> [job name] [north|east|south|west]")
-        print("       chunk_dig new <chunks> [job name] [north|east|south|west]")
+        print("Usage: chunk_dig <chunks> [job name] [north|east|south|west] [--find-floor]")
+        print("       chunk_dig new <chunks> [job name] [north|east|south|west] [--find-floor]")
         print("       chunk_dig archive")
         print("       chunk_dig resume | status | resolve <generation> <before|after> | migrate-shared")
         return
@@ -1462,7 +1655,7 @@ local function run()
     local replacing=mode=="new"
     if replacing then
         if #args<2 or #args>4 then
-            fail("Usage: chunk_dig new <chunks> [job name] [north|east|south|west]")
+            fail("Usage: chunk_dig new <chunks> [job name] [north|east|south|west] [--find-floor]")
         end
     else
         local loaded,r=pcall(readState)
@@ -1482,6 +1675,14 @@ local function run()
                 return names
             end)()," > "),describe(S.home),describe(S.pos)))
         print("Base: output=" .. S.output .. ", fuel=" .. S.fuel)
+        if S.findFloor then
+            local f
+            for _,t in ipairs(S.tasks) do if t.kind=="floor" then f=t end end
+            print(("Find floor: max depth %d; %s"):format(S.findFloor.maxDepth,
+                S.firstLayer and ("mining started at layer " .. S.firstLayer)
+                or f and ("searching at depth " .. (#f.path-1) .. " (" .. f.stage .. ")")
+                or "search not started"))
+        end
         local j=actionRecord()
         if j and j.seq==generation then
             print(("Pending %s #%d\nBefore: %s\nAfter: %s"):format(j.op,j.seq,describe(j.before),describe(j.after)))
@@ -1546,18 +1747,23 @@ local function run()
         if replacing then
             local need,capacity=2*MIN_PROGRESS+SAFETY_MARGIN,limit()
             if need>capacity then fail("round trip needs " .. need .. " fuel but the fuel limit is " .. capacity) end
+        end
+        if findFloor then confirmFindFloor() end
+        if replacing then
             -- Base checks that require turning remain in the journaled startup.
             archiveState()
         end
         turtle.select(1)
         S={owner=os.getComputerID(),created=os.epoch("utc"),chunks=chunks,name=name,output=OUTPUT_SIDE,fuel=FUEL_SIDE,
             margin=SAFETY_MARGIN,progress=MIN_PROGRESS,retry=RETRY_SECONDS,anchor=anchor,
+            findFloor=findFloor and {maxDepth=MAX_FIND_DEPTH} or nil,
             home=HOME,pos=HOME,layer=0,total=0,trips=0,done=false,lastFuel="none consumed yet",
             tasks={{kind="job",stage="start"}}}
         side,generation,verifiedPose=chunks*16,0,true
         fs.makeDir(DIR)
         checkpoint()
-        announce("starting",side .. "x" .. side .. ", output " .. S.output .. ", fuel " .. S.fuel)
+        announce("starting",side .. "x" .. side .. ", output " .. S.output .. ", fuel " .. S.fuel
+            .. (S.findFloor and (", find-floor max depth " .. S.findFloor.maxDepth) or ""))
     end
     while not S.done do
         reportPhase()

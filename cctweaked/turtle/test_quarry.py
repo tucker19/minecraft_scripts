@@ -244,14 +244,21 @@ function drain_barrel()
     end
 end
 
+-- floorOffset: open air for the whole footprint from y=-1 to -floorOffset,
+-- with the usual terrain shifted below it. shaft: air only in the starting
+-- column down to -shaft, terrain elsewhere (the skipped-layer case).
+local SHIFT = O.floorOffset or 0
 local function bedrockY(x, z)
     -- Uneven floor: most cells bedrock at y=-6, some pockets at y=-5.
-    if (x * 3 + z * 5) % 4 == 0 then return -5 end
-    return -6
+    if (x * 3 + z * 5) % 4 == 0 then return -5 - SHIFT end
+    return -6 - SHIFT
 end
 
 local atm = {}
 for _, c in ipairs(O.atm or {}) do atm[key(c[1], c[2], c[3])] = true end
+local liquid = {}
+for _, c in ipairs(O.liquid or {}) do liquid[key(c[1], c[2], c[3])] = c[4] or "minecraft:water" end
+function clear_liquid() liquid = {} end
 
 local function blockAt(x, y, z)
     local k = key(x, y, z)
@@ -260,8 +267,11 @@ local function blockAt(x, y, z)
     if storage[k] then return storage[k]=="shared" and "modded:item_storage" or "minecraft:barrel" end
     if removed[k] then return nil end
     if y >= 0 then return nil end
-    if y <= bedrockY(x, z) then return "minecraft:bedrock" end
+    if liquid[k] then return liquid[k] end
     if atm[k] then return "allthemodium:allthemodium_ore" end
+    if y >= -SHIFT then return nil end
+    if O.shaft and x == 0 and z == 0 and y >= -O.shaft then return nil end
+    if y <= bedrockY(x, z) then return "minecraft:bedrock" end
     local h = (x * 7 + z * 13 + y * 5) % 9
     if O.coalOre and h == 0 then return "minecraft:coal_ore" end
     if O.manyItems and h <= 4 then
@@ -404,11 +414,13 @@ local function dig(dir)
         return false, "Cannot break protected block"
     end
     if name == "minecraft:bedrock" then return false, "Cannot break unbreakable block" end
+    if name:find("water") or name:find("lava") then v("dug a liquid at " .. key(x, y, z)); return false, "Nothing to dig here" end
     if y >= 0 then v("dug at home level " .. key(x, y, z)) end
     if x < 0 or x >= SIDE or z < 0 or z >= SIDE then
         v("dug outside footprint " .. key(x, y, z))
     end
     removed[key(x, y, z)] = true
+    firstDigY = firstDigY or y
     if name == "allthemodium:allthemodium_ore" then
         atmDug = atmDug + 1
         return true -- fake player break deletes the ore
@@ -432,7 +444,17 @@ local function inspect(dir)
         O.arriveAfterInspect=nil
         parkTurtle(dir,"test:tagged_robot",15,true)
     end
-    if name then return true, {name = name} end
+    if dir == "down" and O.inspectError then
+        local e = O.inspectError
+        if O.inspectErrorOnce then O.inspectError = nil end
+        if e == "throw" then error("peripheral detached") end
+        return false, e
+    end
+    if name then
+        local d = {name = name}
+        if name:find("water") or name:find("lava") then d.state = {level = 0} end
+        return true, d
+    end
     return false, "No block to inspect"
 end
 
@@ -617,6 +639,12 @@ os.getComputerLabel = function() return "Test Turtle" end
 os.clock = function() return T end
 os.epoch = function() return 1700000000000+math.floor(T*1000) end
 print = function(s) printed[#printed+1]=s end
+write = function(s) printed[#printed+1]=s end
+prompts = 0
+read = function()
+    prompts = prompts + 1
+    return O.answer
+end
 sleep = function(n)
     tick(n)
     fault("sleep")
@@ -680,7 +708,7 @@ rednet = {
                 elseif not last or (last.status~="resumed" and last.status~="blocked" and last.status~="waiting_turtle") then
                     nestedTrips = nestedTrips + 1
                 end
-            elseif p.status == "mining" and pendingResume then
+            elseif (p.status == "mining" or p.status == "finding_start_depth") and pendingResume then
                 resumeChecks = resumeChecks + 1
                 local s = pendingResume
                 if s[1] ~= px or s[2] ~= py or s[3] ~= pz or s[4] ~= hd then
@@ -789,13 +817,14 @@ for i, s in ipairs(O.startItems or {}) do slots[i] = {name = s[1], count = s[2]}
 
 function results()
     -- Every diggable cell inside the footprint must be gone.
-    local remaining = 0
+    local remaining, skipped = 0, 0
+    local top = -1 - (O.skipAbove or 0)
     for x = 0, SIDE - 1 do
         for z = 0, SIDE - 1 do
             for y = -1, bedrockY(x, z) + 1, -1 do
                 local n = blockAt(x, y, z)
                 if n and n ~= "allthemodium:allthemodium_ore" then
-                    remaining = remaining + 1
+                    if y > top then skipped = skipped + 1 else remaining = remaining + 1 end
                 end
             end
         end
@@ -810,7 +839,7 @@ function results()
         x = px, y = py, z = pz, heading = hd, selected = selected,
         last = last, violations = violations, statuses = statuses,
         lost = lost, minedItems = minedItems, invItems = inv,
-        outputMined = outMined, atmDug = atmDug, remaining = remaining,
+        outputMined = outMined, atmDug = atmDug, remaining = remaining, skipped = skipped,
         maxUsed = maxUsed, minY = minY, nestedTrips = nestedTrips,
         resumeChecks = resumeChecks, resumeFails = resumeFails,
         cargoDetail = cargoDetail, travelUpOffShaft = travelUpOffShaft,
@@ -820,7 +849,7 @@ function results()
         moves = moveCount, minedCoalBurned = minedCoalBurned,
         turtleInspections=turtleInspections, waitPackets=waitPackets, attacks=attackCount,
         outputCoal = outputItems["minecraft:coal"] or 0,
-        cutCount = cutIndex-1, printed = printed,
+        cutCount = cutIndex-1, printed = printed, prompts = prompts, firstDigY = firstDigY,
         wirePushes=wirePushes, blindSucks=blindSucks, wrongPushes=wrongPushes,
         wireAttempts=wireAttempts, wireLists=wireLists,
         barrel=barrel, barrelRemoved=barrelRemoved, pulledFrom=pulledFrom, pushedInto=pushedInto,
@@ -856,6 +885,10 @@ class Simulation:
                                           ("FUEL_SIDE", "fuelSide", "back")]:
             code = code.replace(f'local {constant} = "{default}"',
                                 f'local {constant} = "{opts[option]}"')
+        if opts.get("maxFind"):
+            assert "local MAX_FIND_DEPTH = 384" in code
+            code = code.replace("local MAX_FIND_DEPTH = 384",
+                                f"local MAX_FIND_DEPTH = {opts['maxFind']}")
         # A fresh Lua closure per invocation, rather than repeatedly calling
         # a saved execution stack. The mocked world/FS outlive each process.
         self.code = code
@@ -871,6 +904,8 @@ class Simulation:
         args = [str(self.opts.get("chunks", 1)), "Test Quarry"]
         if self.opts.get("anchor"):
             args.append(self.opts["anchor"])
+        if self.opts.get("findFloor"):
+            args.append("--find-floor")
         return self.command(*args)
 
     def results(self):
@@ -1773,6 +1808,306 @@ def new_startup_failure_after_archive_does_not_restore_or_resume():
     assert r["moves"] == 0 and r["minedItems"] == 0
     assert sim.command(startup=True)[0] is None
     assert dict(sim.g.filesystem_snapshot().items()) == relocated(saved)
+
+
+# ---------------------------------------------------------------- --find-floor
+FF = dict(findFloor=True, answer="yes")
+
+
+def check_floor(r, name, first, shift=0):
+    """Completed find-floor job: mining started at layer `first` (the first
+    diggable block below the starting column) and cleared the whole footprint
+    from there down. `shift` lowers the mocked bedrock floor."""
+    assert not r["violations"], (name, r["violations"][:5])
+    assert r["last"]["status"] == "complete", (name, r["last"]["status"], r["last"]["detail"])
+    assert (r["x"], r["y"], r["z"], r["heading"]) == (0, 0, 0, 0), (name, r)
+    assert r["selected"] == 1 and r["lost"] == 0 and r["invItems"] == 0, name
+    assert r["remaining"] == 0, (name, "cells skipped below the floor", r["remaining"])
+    assert r["atmDug"] == 0 and r["nestedTrips"] == 0, name
+    assert r["resumeFails"] == 0, (name, "did not resume at saved cell/heading")
+    assert r["minY"] == -5 - shift, (name, "descended to", r["minY"])
+    job = r["last"]["job"]
+    assert job["layer"] == 5 + shift, (name, job["layer"])
+    assert job["firstLayer"] == first and job["findFloor"] == 384, (name, job["firstLayer"])
+    assert r["firstDigY"] == -first, (name, "first dig at", r["firstDigY"])
+    return r
+
+
+@test
+def find_floor_terrain_immediately_below_home():
+    r = check_floor(run(**FF), "immediate terrain", 1)
+    assert r["prompts"] == 1
+    assert any("cannot prove the whole footprint" in str(p) for p in r["printed"])
+    # Same work as an ordinary start: nothing above layer 1 to skip.
+    plain = check_complete(run(), "plain")
+    assert plain["prompts"] == 0 and plain["last"]["job"]["firstLayer"] is None
+    assert r["minedItems"] == plain["minedItems"]
+
+
+@test
+def find_floor_several_empty_layers_then_terrain():
+    r = check_floor(run(floorOffset=4, **FF), "open air", 5, shift=4)
+    i = r["statuses"].index("finding_start_depth")
+    assert "mining" in r["statuses"][i:], r["statuses"]
+    # Full footprint from the floor level down: every cell was mined.
+    assert r["remaining"] == 0 and r["skipped"] == 0
+
+
+@test
+def find_floor_skips_upper_layers_seen_only_outside_the_column():
+    # Air only in the starting column; terrain elsewhere above the floor is
+    # deliberately skipped (the documented limitation), everything from the
+    # first mined level down is cleared.
+    r = check_floor(run(shaft=3, skipAbove=3, **FF), "shaft", 4)
+    assert r["skipped"] == 16 * 16 * 3 - 3, r["skipped"]
+
+
+@test
+def find_floor_service_trips_use_descent_and_original_dock():
+    # 200 fuel and an empty fuel store: the search runs low at depth 84,
+    # returns up the recorded column, waits for fuel at the original dock,
+    # then returns to the exact saved search cell.
+    sim = Simulation(floorOffset=100, fuel=200, fuelStock=0, limit=1000, manyItems=True,
+                     stopStatus="waiting_fuel", cuts=[], **FF)
+    assert sim.start()[0] == "TEST_END"
+    r = sim.results()
+    assert (r["x"], r["y"], r["z"]) == (0, 0, 0) and not r["violations"]
+    assert "returning_to_refuel" in r["statuses"] and "mining" not in r["statuses"]
+    sim.command("status")
+    assert any("searching at depth 84 (search)" in str(p) for p in sim.results()["printed"])
+    sim.g.OPTIONS.refillAt = 0
+    sim.g.OPTIONS.stopStatus = ""
+    assert sim.command(startup=True)[0] == "TEST_END"
+    r = check_floor(sim.results(), "deep floor with trips", 101, shift=100)
+    first = r["statuses"].index("mining")
+    assert "returning_to_refuel" in r["statuses"][:first]
+    assert r["resumeChecks"] >= 2, r["resumeChecks"]  # search trip and later trips
+    assert "returning_to_unload" in r["statuses"][first:]
+    assert r["prompts"] == 1  # resume never asked again
+
+
+@test
+def find_floor_fuel_reserve_covers_climb_back():
+    sim = Simulation(floorOffset=100, fuel=200, fuelStock=0, stopStatus="waiting_fuel", cuts=[], **FF)
+    assert sim.start()[0] == "TEST_END"
+    r = sim.results()
+    # Turned back with the reserve intact rather than descending further.
+    assert r["minY"] == -84 and r["fuel"] >= 200 - 2 * 84, (r["minY"], r["fuel"])
+    assert r["moves"] == 2 * 84 and r["minedItems"] == 0
+
+
+@test
+def find_floor_pauses_on_liquid_then_continues_when_cleared():
+    for spec, depth in [((0, -3, 0), 2), ((0, -1, 0, "minecraft:lava"), 0)]:
+        sim = Simulation(floorOffset=4, liquid=[spec], stopStatus="find_floor_paused", cuts=[], **FF)
+        assert sim.start()[0] == "TEST_END"
+        r = sim.results()
+        assert not r["violations"], r["violations"]
+        assert f"liquid below at depth {depth}" in r["last"]["detail"], r["last"]["detail"]
+        assert (r["x"], r["y"], r["z"]) == (0, -depth, 0) and r["minedItems"] == 0
+        # Still paused on reboot, without moving.
+        moves = r["moves"]
+        assert sim.command(startup=True)[0] == "TEST_END"
+        assert sim.results()["moves"] == moves
+        sim.g.clear_liquid()
+        sim.g.OPTIONS.stopStatus = ""
+        assert sim.command(startup=True)[0] == "TEST_END"
+        check_floor(sim.results(), "after liquid", 5, shift=4)
+
+
+@test
+def find_floor_pauses_on_protected_block():
+    sim = Simulation(floorOffset=4, atm=[(0, -3, 0)], stopStatus="find_floor_paused", cuts=[], **FF)
+    assert sim.start()[0] == "TEST_END"
+    r = sim.results()
+    assert "protected block below at depth 2: allthemodium" in r["last"]["detail"], r["last"]["detail"]
+    assert (r["x"], r["y"], r["z"]) == (0, -2, 0)
+    assert r["atmDug"] == 0 and r["minedItems"] == 0 and not r["violations"]
+    assert r["last"]["job"]["layer"] == 0
+
+
+@test
+def find_floor_pauses_on_uncertain_inspection():
+    for err, text in [("Unexpected inspect failure", "uncertain inspection result below at depth 0"),
+                      ("throw", "cannot inspect below at depth 0")]:
+        sim = Simulation(floorOffset=2, inspectError=err, stopStatus="find_floor_paused", cuts=[], **FF)
+        assert sim.start()[0] == "TEST_END"
+        r = sim.results()
+        assert text in r["last"]["detail"], r["last"]["detail"]
+        assert r["moves"] == 0 and (r["x"], r["y"], r["z"]) == (0, 0, 0)
+        sim.g.OPTIONS.inspectError = None
+        sim.g.OPTIONS.stopStatus = ""
+        assert sim.command(startup=True)[0] == "TEST_END"
+        check_floor(sim.results(), "after inspect error", 3, shift=2)
+
+
+@test
+def find_floor_turtle_and_movement_obstruction():
+    # Another turtle appears in the column: 60 s guard, no attack or dig.
+    r = run(floorOffset=4, arriveAfterInspect="down", **FF)
+    check_turtle_wait(r, "down")
+    assert r["attacks"] == 0
+    check_floor(r, "turtle in column", 5, shift=4)
+    # A turtle blocks the actual move.
+    r = run(floorOffset=4, arriveOnMove="down", **FF)
+    check_turtle_wait(r, "down")
+    check_floor(r, "turtle on move", 5, shift=4)
+    # Failed moves are retried, never taken as the floor or as completion.
+    r = run(floorOffset=6, failEvery=3, **FF)
+    assert "blocked" in r["statuses"]
+    check_floor(r, "failed moves", 7, shift=6)
+
+
+@test
+def find_floor_depth_limit_returns_home_and_stops():
+    sim = Simulation(floorOffset=20, maxFind=10, cuts=[], **FF)
+    sim.start()
+    r = sim.results()
+    assert r["last"]["status"] == "error", r["last"]
+    assert "10-block search limit" in r["last"]["detail"], r["last"]["detail"]
+    assert (r["x"], r["y"], r["z"], r["heading"]) == (0, 0, 0, 0)
+    assert r["minY"] == -10 and r["moves"] == 20 and r["minedItems"] == 0
+    assert not r["violations"] and "returning_home" in r["statuses"]
+    sim.command(startup=True)
+    r2 = sim.results()
+    assert r2["moves"] == 20 and r2["last"]["status"] == "error"
+    sim.command("status")
+    assert any("Find floor: max depth 10" in str(p) for p in sim.results()["printed"])
+
+
+def recover_floor(sim, count, first, shift):
+    outcome = sim.start()
+    manual = []
+    for _ in range(count):
+        assert outcome[0] == "POWER_CUT", (outcome, sim.results()["printed"][-6:])
+        outcome = sim.command(startup=True)
+        r = sim.results()
+        if r["last"]["status"] == "recovery_required":
+            seq, choice = sim.g.manual_choice()
+            manual.append(choice)
+            outcome = sim.command("resolve", str(seq), choice)
+    assert outcome[0] == "TEST_END", (outcome, sim.results()["printed"][-6:])
+    return check_floor(sim.results(), "restarted find-floor", first, shift), manual
+
+
+@test
+def find_floor_interrupted_descent_resumes_same_search():
+    phase = ":finding_start_depth"
+    cuts = [c + phase for c in [
+        "before_move_down", "after_move_down", "before_action_write", "during_action_write",
+        "after_action_write", "before_action_publish", "after_action_publish",
+        "before_state_write", "during_state_write", "after_state_write",
+        "before_state_publish", "after_state_publish", "before_action_clear", "phase"]]
+    sim = Simulation(floorOffset=20, cuts=cuts, **FF)
+    r, manual = recover_floor(sim, len(cuts), 21, 20)
+    assert r["cutCount"] == len(cuts)
+    assert r["prompts"] == 1  # auto/resume used the saved option
+    # Every committed step was counted exactly once: 20 down, then mining.
+    assert r["firstDigY"] == -21
+
+
+@test
+def find_floor_interrupted_turns_and_search_service_trip():
+    # The search itself never turns (vertical moves; an empty-cargo service
+    # trip does not turn either), so cover the turns on both sides of it:
+    # initial base checks before the search, and the first floor-layer turn
+    # right after landing; plus moves on the search's fuel trip.
+    cuts = ["after_turn:starting",
+            "after_move_down:finding_start_depth",
+            "after_move:returning_to_refuel", "after_move:resuming",
+            "before_turn:mining", "after_turn:mining"]
+    sim = Simulation(floorOffset=100, fuel=200, fuelStock=0, refillAt=100, cuts=cuts, **FF)
+    r, manual = recover_floor(sim, len(cuts), 101, 100)
+    assert r["cutCount"] == len(cuts)
+    assert "before" in manual and "after" in manual, manual
+    i = r["statuses"].index("returning_to_refuel")
+    assert i < r["statuses"].index("mining")
+    assert r["resumeChecks"] >= 1 and r["resumeFails"] == 0
+
+
+@test
+def find_floor_argument_parsing_and_preflight():
+    def detail(sim):
+        r = sim.results()
+        last = r.get("last")
+        return str(r["printed"][-1] if r["printed"] else "") + " | " + str(last["detail"] if last else "")
+
+    for args, name, h in [(("3", "--find-floor"), "Test Turtle", None),
+                          (("3", "Mining Quarry 03", "--find-floor"), "Mining Quarry 03", None),
+                          (("--find-floor", "3", "Mining Quarry 03", "east"), "Mining Quarry 03", 1),
+                          (("3", "Mining Quarry 03", "east", "--find-floor"), "Mining Quarry 03", 1)]:
+        sim = Simulation(gps=True, cuts=["after_state_publish"], **FF)
+        assert sim.command(*args)[0] == "POWER_CUT", (args, detail(sim))
+        job = sim.g.latest_record()["job"]
+        assert job["chunks"] == 3 and job["name"] == name and job["findFloor"]["maxDepth"] == 384
+        assert (job["anchor"]["h"] if job["anchor"] else None) == h
+        assert sim.results()["prompts"] == 1 and sim.results()["moves"] == 0
+
+    # Plain start: no prompt, no option saved.
+    sim = Simulation(cuts=["after_state_publish"])
+    assert sim.command("3", "Mining Quarry 03")[0] == "POWER_CUT"
+    assert sim.g.latest_record()["job"]["findFloor"] is None and sim.results()["prompts"] == 0
+
+    # Errors before anything is saved.
+    for args, expected in [(("3", "--find-flor"), "Unknown option --find-flor"),
+                           (("3", "--find-floor", "--find-floor"), "more than once"),
+                           (("--find-floor",), "only applies when starting a new job"),
+                           (("3", "Name", "up", "--find-floor"), "Invalid quarry size"),
+                           (("0", "--find-floor"), "Invalid quarry size")]:
+        sim = Simulation(cuts=[], answer="yes")
+        sim.command(*args)
+        assert expected in detail(sim), (args, detail(sim))
+        assert dict(sim.g.filesystem_snapshot().items()) == {} or not sim.g.latest_record()
+        assert sim.results()["prompts"] == 0 and sim.results()["moves"] == 0
+    sim = Simulation(cuts=[], answer="no")
+    sim.command("3", "--find-floor")
+    assert "not confirmed" in detail(sim) and not sim.g.latest_record()
+    assert sim.results()["prompts"] == 1 and sim.results()["moves"] == 0
+
+    # With a saved job: no mode may archive, replace or reinterpret it.
+    sim = Simulation(gps=True, cuts=["after_state_publish", "after_state_publish"])
+    assert sim.start()[0] == "POWER_CUT"
+    saved = dict(sim.g.filesystem_snapshot().items())
+    sim.g.OPTIONS.answer = "yes"
+    for args, expected in [(("3", "--find-floor"), "A saved quarry exists"),
+                           (("resume", "--find-floor"), "only applies"),
+                           (("auto", "--find-floor"), "only applies"),
+                           (("status", "--find-floor"), "only applies"),
+                           (("archive", "--find-floor"), "only applies"),
+                           (("resolve", "1", "after", "--find-floor"), "only applies"),
+                           (("migrate-shared", "--find-floor"), "only applies"),
+                           (("new", "--find-floor"), "Usage: chunk_dig new"),
+                           (("new", "2", "a", "east", "x", "--find-floor"), "Usage: chunk_dig new"),
+                           (("new", "2", "--find-floor", "--bogus"), "Unknown option --bogus"),
+                           (("new", "65", "--find-floor"), "Invalid quarry size")]:
+        sim.command(*args)
+        assert expected in detail(sim), (args, detail(sim))
+        assert dict(sim.g.filesystem_snapshot().items()) == saved, args
+        assert sim.results()["prompts"] == 0
+    sim.g.OPTIONS.answer = "nope"
+    sim.command("new", "3", "Mining Quarry 03", "east", "--find-floor")
+    assert "not confirmed" in detail(sim)
+    assert dict(sim.g.filesystem_snapshot().items()) == saved
+    assert sim.results()["prompts"] == 1
+    sim.g.OPTIONS.answer = "yes"
+    sim.command("new", "3", "Mining Quarry 03", "east", "--find-floor")
+    r = sim.results()
+    assert any("Archived quarry job to " + ARCHIVE + "01" == str(p) for p in r["printed"]), r["printed"][-5:]
+    job = sim.g.latest_record()["job"]
+    assert job["findFloor"]["maxDepth"] == 384 and job["name"] == "Mining Quarry 03" and job["anchor"]["h"] == 1
+
+    # Fuel-limit preflight for new runs before the prompt.
+    sim = Simulation(limit=100, cuts=[], answer="yes")
+    sim.command("new", "2", "--find-floor")
+    assert "fuel limit is 100" in detail(sim) and sim.results()["prompts"] == 0
+
+
+@test
+def existing_job_without_find_floor_resumes_unchanged():
+    sim = Simulation(cuts=["after_move:mining", "after_state_publish:mining"], answer="yes")
+    r, manual = recover(sim, 2)
+    assert r["last"]["job"]["findFloor"] is None and r["last"]["job"]["firstLayer"] is None
+    assert r["prompts"] == 0 and "finding_start_depth" not in r["statuses"]
 
 
 def test_dashboard():

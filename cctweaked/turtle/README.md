@@ -89,6 +89,41 @@ A `/startup.lua` for the dashboard computer only:
 shell.execute("/turtle_wireless_dash", "turtle_wireless_dash")
 ```
 
+## Start lower with --find-floor (optional)
+
+Use `--find-floor` when the turtle starts above an open pit, a cave, or a platform, and you want it to skip the air below home instead of starting the quarry one block below. It only works with new jobs and is off unless you add it:
+
+```text
+chunk_dig 3 --find-floor
+chunk_dig 3 "Mining Quarry 03" --find-floor
+chunk_dig 3 "Mining Quarry 03" east --find-floor
+chunk_dig new 3 "Mining Quarry 03" east --find-floor
+```
+
+The flag can go anywhere after the program name. The positional arguments are the same as without it. The other modes reject it (`resume`, `auto`, `status`, `archive`, `resolve`, `migrate-shared`), as do a repeated flag and any other `--` option. All argument, GPS, saved-job, and (for `new`) fuel-limit checks run before any state is read, archived, or created.
+
+**Warning: only the starting column is checked.** The turtle drops down the column directly below home and starts the full quarry at the first diggable block it finds. It cannot prove the rest of the footprint is empty. Any blocks elsewhere in the footprint above that level are skipped and never mined. Before anything is archived or saved, the turtle prints this warning and asks you to type `yes`. Any other answer stops with `--find-floor not confirmed; no job was created or archived`.
+
+What happens after you confirm:
+
+1. Home position, facing, size, name, GPS anchor (if given), and storage sides are saved as usual, plus `findFloor` with the search limit. Home stays the original dock for the whole job.
+2. The usual initial base checks, unload, and refuel run at home.
+3. The turtle reports `finding_start_depth` and moves down one block at a time. It moves only when the block below inspects as confirmed air (`No block to inspect`). Each step is a normal journaled move with a checkpoint, and the 60-second turtle guard and fuel reserve apply.
+4. At the first diggable block below, it digs that block and starts the normal full-footprint layer at that level. It does not descend an extra layer. `chunk_dig status` shows `mining started at layer N`, and telemetry reports `firstLayer`.
+5. The recorded descent column becomes the first layer's route home. Every return, unload, refuel, resume, and recovery during the search or later uses it. A trip during the search climbs the column, services at the original dock, and returns to the exact saved search cell.
+
+It reports `find_floor_paused` and holds in place, retrying every `RETRY_SECONDS`, when the block below is:
+
+- a liquid or liquid-like block (water, lava, fluids, or blocks with a `level` or `waterlogged` state)
+- protected (bedrock, Allthemodium-family ores, chests, barrels, shulkers, drawers)
+- an inspection error or an unexpected inspection result
+
+None of these is treated as the floor. Remove the cause, or stop and archive the job. Another turtle below gets the usual `waiting_turtle` pause. A failed downward move reports `blocked` and is retried; it is never treated as terrain or completion. Before each step the turtle needs enough fuel for that step, the climb home, and `SAFETY_MARGIN`. Otherwise it makes a normal `returning_to_refuel` trip.
+
+**Depth limit.** `MAX_FIND_DEPTH = 384` blocks below home (the full overworld height from y=320 to y=-64). The value is saved with the job when it starts, so editing the constant later does not change saved jobs. If the turtle is still in air at the limit, it climbs the recorded column home, faces its original heading, and stops with `error: find-floor reached its 384-block search limit ...`. Nothing is mined. Resuming repeats the same message without moving. Run `chunk_dig archive` to discard the job.
+
+**Recovery.** Search progress is part of the normal checkpoint. After a reboot, `chunk_dig resume` (or `auto` from startup) continues the same search from the saved cell. It resolves any journaled move first, as usual, without changing home or repeating an uncommitted move. Do not add `--find-floor` again; the saved option is used, and resume rejects the flag. If recovery reports `recovery_required`, follow [Recover manually](#recover-manually). The pending move is in the starting column (relative x=0, z=0).
+
 ## Enable automatic resume on the turtle
 
 If there is no existing `/startup.lua` or conflicting startup setup, download the provided turtle startup script:
@@ -148,6 +183,8 @@ The turtle keeps broadcasting telemetry while waiting.
 | `recovery_required` | The saved state or physical pose cannot be trusted automatically. | No further quarry actions; read the turtle terminal before doing anything. |
 
 Every move, dig, drop, suck, and refuel result is checked. Coordinates change only after a successful move. Items are never thrown into the world. A failed action is never reported as success.
+
+With `--find-floor`: `finding_start_depth` (searching down the starting column) and `find_floor_paused` (liquid, protected block, or uncertain inspection below; holds in place and retries). See [Start lower with --find-floor](#start-lower-with---find-floor-optional).
 
 Other statuses: `starting`, `mining`, `returning_to_unload`, `returning_to_refuel`, `unloading`, `refueling`, `resuming`, `returning_home`, `complete`.
 
@@ -225,7 +262,7 @@ To archive and immediately start a **32×32** quarry, put the stopped turtle at 
 chunk_dig new 2 "Mining Quarry 02"
 ```
 
-`new` accepts the same size, optional name, and optional GPS-facing argument as a numeric start. It checks the arguments, required GPS fix if requested, and initial fuel capacity before archiving. It then starts from the current position and facing using the installed script's configuration, not the archived settings. If there is no saved job, it starts without making an archive. If archiving fails, it does not start; if startup fails after the archive succeeds, the printed archive path remains available and the old job is not restored or resumed automatically.
+`new` accepts the same size, optional name, optional GPS-facing argument, and optional `--find-floor` as a numeric start. With `--find-floor`, the confirmation prompt comes after these checks but before archiving, so declining leaves the old job untouched. It checks the arguments, required GPS fix if requested, and initial fuel capacity before archiving. It then starts from the current position and facing using the installed script's configuration, not the archived settings. If there is no saved job, it starts without making an archive. If archiving fails, it does not start; if startup fails after the archive succeeds, the printed archive path remains available and the old job is not restored or resumed automatically.
 
 Keep the archive intact; do not restore individual checkpoint files. An archive preserves files, not the turtle's position, facing, fuel, or world state. Starting another job can invalidate the old job's recovery assumptions.
 
@@ -361,7 +398,7 @@ pip install lupa
 python3 cctweaked/turtle/test_quarry.py
 ```
 
-The harness checks the existing quarry behavior and abandons the Lua coroutine around moves, turns, digs, transfers, checkpoint publication and phase changes. Collision tests simulate spare turtles in front, above, and below, including a second wait cycle, a turtle that arrives just before a dig or during a failed move, and reboot during home travel. Shared-inventory tests cover entry and reboot from all four headings, masked peripherals, sorting and virtual coal, and interrupted migration. Archive and new-job tests cover whole-directory preservation, numbering, invalid arguments and preflight failures, failed moves and fresh startup failures, and boot after archiving. These are simulated, not actual modded storage, block placement, or chunk unload/reload tests.
+The harness checks the existing quarry behavior and abandons the Lua coroutine around moves, turns, digs, transfers, checkpoint publication and phase changes. Collision tests simulate spare turtles in front, above, and below, including a second wait cycle, a turtle that arrives just before a dig or during a failed move, and reboot during home travel. Shared-inventory tests cover entry and reboot from all four headings, masked peripherals, sorting and virtual coal, and interrupted migration. Find-floor tests cover terrain directly below home, several empty layers, a column-only shaft (showing the skipped upper layers), the first mining level and full-footprint coverage below it, and fuel trips during the search that return to the saved cell through the original dock. They also cover pauses for water, lava, protected blocks, and inspection errors; turtles and failed moves in the column; the depth limit; power cuts at every journal and checkpoint boundary during the descent; interrupted turns before and after the search; and argument parsing, the confirmation prompt, and preflight with or without a saved job. Archive and new-job tests cover whole-directory preservation, numbering, invalid arguments and preflight failures, failed moves and fresh startup failures, and boot after archiving. These are simulated, not actual modded storage, block placement, or chunk unload/reload tests.
 
 `python3 -m unittest discover -s cctweaked/turtle -p "test_swarm*.py"` runs the swarm suites. The runtime suite runs the real coordinator and worker programs against simulated turtles, GPS, Rednet, wired dock, and filesystem. It covers a zero-config quarry where three turtles define, join, and clear a one-layer chunk, plus a reboot during the first turtle's probe with a lost define reply and a coordinator restart. It also covers a newcomer losing power mid-lane, startup-hook preservation, bay contention, and the earlier collision and station cases. A simulated "cut" stops the program at a chosen move and restarts it from saved files, which models an unload but is not an in-game unload/reload test.
 
